@@ -1,3 +1,4 @@
+from collections import namedtuple
 import inspect
 from zope.interface import implementer, provider
 
@@ -161,6 +162,92 @@ def wraps_view(wrapper):
         return preserve_view_attrs(view, wrapper_view)
 
     return inner
+
+
+# A record describing a single named request param provider. ``provider``
+# is a callable accepting ``(request, **deps)`` where ``deps`` are the
+# resolved values of the params named in ``requires``.
+RequestParamProvider = namedtuple(
+    'RequestParamProvider', ('provider', 'requires')
+)
+
+
+def validate_request_param_providers(providers):
+    """Validate a mapping of request param providers at config time.
+
+    Ensures that every dependency named in a provider's ``requires``
+    refers to a registered provider and that the dependency graph is
+    acyclic.
+    """
+    for name, record in providers.items():
+        for dep in record.requires:
+            if dep not in providers:
+                raise ConfigurationError(
+                    'Request param provider %r requires unregistered '
+                    'provider %r' % (name, dep)
+                )
+
+    # detect dependency cycles with a depth-first traversal
+    done = set()
+    visiting = []
+
+    def visit(name):
+        if name in done:
+            return
+        if name in visiting:
+            cycle = visiting[visiting.index(name) :] + [name]
+            raise ConfigurationError(
+                'Cyclic dependency between request param providers: '
+                '%s' % ' -> '.join(cycle)
+            )
+        visiting.append(name)
+        for dep in providers[name].requires:
+            visit(dep)
+        visiting.pop()
+        done.add(name)
+
+    for name in providers:
+        visit(name)
+
+
+def resolve_request_param(name, request, cache, providers):
+    """Resolve a single request param, memoizing the result in ``cache``.
+
+    Dependencies declared via ``requires`` are resolved first and passed
+    to the provider as keyword arguments. The cache is scoped to a single
+    request so a provider is invoked at most once per request, no matter
+    how many deriver layers declare the same param.
+    """
+    if name in cache:
+        return cache[name]
+    record = providers[name]
+    deps = {
+        dep: resolve_request_param(dep, request, cache, providers)
+        for dep in record.requires
+    }
+    value = record.provider(request, **deps)
+    cache[name] = value
+    return value
+
+
+def request_params_view(view, param_names, providers):
+    """Wrap ``view`` so declared request params are resolved and injected.
+
+    Resolution happens lazily when the view is invoked (never at
+    configuration or predicate-evaluation time) and any exception raised
+    by a provider propagates like a normal view exception, so it can be
+    handled by an exception view.
+    """
+
+    def request_params_view(context, request):
+        cache = request.__dict__.setdefault('_request_param_cache', {})
+        params = {
+            name: resolve_request_param(name, request, cache, providers)
+            for name in param_names
+        }
+        return view(context, request, **params)
+
+    return request_params_view
 
 
 def preserve_view_attrs(view, wrapper):

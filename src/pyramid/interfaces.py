@@ -1554,6 +1554,14 @@ class IViewDeriver(Interface):
         'This attribute is optional.'
     )
 
+    request_params = Attribute(
+        'A list of request param names, declared by the deriver, that '
+        'are resolved once per request by providers registered with '
+        ':meth:`pyramid.config.Configurator.add_request_param_provider` '
+        'and passed to the derived view as keyword arguments. '
+        'This attribute is optional.'
+    )
+
     def __call__(view, info):
         """
         Derive a new view from the supplied view.
@@ -1592,6 +1600,15 @@ class IViewDeriverInfo(Interface):
 
 class IViewDerivers(Interface):
     """Interface for view derivers list"""
+
+
+class IRequestParamProviders(Interface):
+    """Interface for the registry of named request param providers.
+
+    The utility is a mapping of provider name to
+    ``pyramid.viewderivers.RequestParamProvider`` records, registered via
+    :meth:`pyramid.config.Configurator.add_request_param_provider`.
+    """
 
 
 class ICacheBuster(Interface):

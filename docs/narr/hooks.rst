@@ -1774,6 +1774,61 @@ View derivers are unique in that they have access to most of the options
 passed to :meth:`pyramid.config.Configurator.add_view` in order to decide what
 to do, and they have a chance to affect every view in the application.
 
+.. _view_deriver_request_params:
+
+Request Param Providers
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Some view derivers need values that can only be computed from the current
+request, such as the negotiated locale or the current user. Instead of each
+deriver recomputing (or re-reading settings at configuration time), a deriver
+may declare the request params it needs via a ``request_params`` attribute,
+and the application provides the values by registering named providers with
+:meth:`pyramid.config.Configurator.add_request_param_provider`.
+
+A provider is a callable accepting the request (plus any params it declared
+as ``requires`` dependencies) and returning the value of the param. The
+value is resolved lazily when a view using the deriver is invoked, is
+resolved at most once per request no matter how many deriver layers declare
+the same param, and is passed to the deriver's wrapper as a keyword argument.
+If a provider raises an exception, it is handled like any other view
+exception and may be rendered by an :term:`exception view`. Params are never
+resolved for a view whose predicates did not match.
+
+For example, two derivers that both need the request's locale - one to
+format dates and one to format numbers - can share a single ``locale``
+provider:
+
+.. code-block:: python
+    :linenos:
+
+    def locale_provider(request):
+        return request.locale_name
+
+    config.add_request_param_provider('locale', locale_provider)
+
+    def localized_date_view(view, info):
+        if not info.options.get('localize_dates'):
+            return view
+
+        def wrapper_view(context, request, locale=None):
+            request.response_locale = locale
+            return view(context, request)
+
+        return wrapper_view
+
+    localized_date_view.options = ('localize_dates',)
+    localized_date_view.request_params = ('locale',)
+
+    config.add_view_deriver(localized_date_view)
+
+Provider names and dependencies are checked at configuration time: a deriver
+declaring an unknown param, a provider requiring an unregistered provider,
+or a dependency cycle all raise
+:class:`pyramid.exceptions.ConfigurationError` during configuration. A
+deriver that returns the view unchanged (for example because its option was
+not used) does not cause its declared params to be resolved.
+
 .. _exception_view_derivers:
 
 Exception Views and View Derivers

@@ -1969,6 +1969,442 @@ class TestAddDeriver(unittest.TestCase):
             raise AssertionError
 
 
+class TestValidateRequestParamProviders(unittest.TestCase):
+    def _callFUT(self, providers):
+        from pyramid.viewderivers import validate_request_param_providers
+
+        return validate_request_param_providers(providers)
+
+    def _makeProvider(self, requires=()):
+        from pyramid.viewderivers import RequestParamProvider
+
+        return RequestParamProvider(lambda request, **deps: None, requires)
+
+    def test_no_providers(self):
+        self.assertEqual(self._callFUT({}), None)
+
+    def test_valid_dependency_chain(self):
+        providers = {
+            'a': self._makeProvider(),
+            'b': self._makeProvider(('a',)),
+            'c': self._makeProvider(('a', 'b')),
+        }
+        self.assertEqual(self._callFUT(providers), None)
+
+    def test_unknown_dependency(self):
+        providers = {'a': self._makeProvider(('missing',))}
+        self.assertRaises(ConfigurationError, self._callFUT, providers)
+
+    def test_self_cycle(self):
+        providers = {'a': self._makeProvider(('a',))}
+        self.assertRaises(ConfigurationError, self._callFUT, providers)
+
+    def test_direct_cycle(self):
+        providers = {
+            'a': self._makeProvider(('b',)),
+            'b': self._makeProvider(('a',)),
+        }
+        self.assertRaises(ConfigurationError, self._callFUT, providers)
+
+    def test_indirect_cycle(self):
+        providers = {
+            'a': self._makeProvider(('b',)),
+            'b': self._makeProvider(('c',)),
+            'c': self._makeProvider(('a',)),
+        }
+        self.assertRaises(ConfigurationError, self._callFUT, providers)
+
+
+class TestResolveRequestParam(unittest.TestCase):
+    def _callFUT(self, name, request, cache, providers):
+        from pyramid.viewderivers import resolve_request_param
+
+        return resolve_request_param(name, request, cache, providers)
+
+    def _makeProvider(self, fn, requires=()):
+        from pyramid.viewderivers import RequestParamProvider
+
+        return RequestParamProvider(fn, requires)
+
+    def test_resolves_and_memoizes(self):
+        calls = []
+
+        def provider(request):
+            calls.append(request)
+            return 'value'
+
+        providers = {'a': self._makeProvider(provider)}
+        cache = {}
+        request = DummyRequest()
+        self.assertEqual(
+            self._callFUT('a', request, cache, providers), 'value'
+        )
+        self.assertEqual(
+            self._callFUT('a', request, cache, providers), 'value'
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(cache, {'a': 'value'})
+
+    def test_dependencies_resolved_first_and_passed_as_kwargs(self):
+        seen = {}
+
+        def dep_provider(request):
+            return 'dep-value'
+
+        def provider(request, dep=None):
+            seen['dep'] = dep
+            return 'value'
+
+        providers = {
+            'dep': self._makeProvider(dep_provider),
+            'a': self._makeProvider(provider, ('dep',)),
+        }
+        result = self._callFUT('a', DummyRequest(), {}, providers)
+        self.assertEqual(result, 'value')
+        self.assertEqual(seen['dep'], 'dep-value')
+
+    def test_shared_dependency_resolved_once(self):
+        calls = []
+
+        def dep_provider(request):
+            calls.append(request)
+            return 'dep-value'
+
+        providers = {
+            'dep': self._makeProvider(dep_provider),
+            'a': self._makeProvider(lambda request, dep: dep, ('dep',)),
+            'b': self._makeProvider(lambda request, dep: dep, ('dep',)),
+        }
+        cache = {}
+        request = DummyRequest()
+        self._callFUT('a', request, cache, providers)
+        self._callFUT('b', request, cache, providers)
+        self.assertEqual(len(calls), 1)
+
+
+class TestRequestParamsView(unittest.TestCase):
+    def _makeOne(self, view, param_names, providers):
+        from pyramid.viewderivers import request_params_view
+
+        return request_params_view(view, param_names, providers)
+
+    def _makeProvider(self, fn, requires=()):
+        from pyramid.viewderivers import RequestParamProvider
+
+        return RequestParamProvider(fn, requires)
+
+    def test_injects_resolved_params_as_kwargs(self):
+        captured = {}
+
+        def view(context, request, locale=None):
+            captured['locale'] = locale
+            return 'OK'
+
+        providers = {'locale': self._makeProvider(lambda request: 'zh_CN')}
+        wrapper = self._makeOne(view, ('locale',), providers)
+        self.assertEqual(wrapper(None, DummyRequest()), 'OK')
+        self.assertEqual(captured['locale'], 'zh_CN')
+
+    def test_cache_is_scoped_to_a_single_request(self):
+        calls = []
+
+        def provider(request):
+            calls.append(request)
+            return len(calls)
+
+        providers = {'locale': self._makeProvider(provider)}
+        view = lambda context, request, locale=None: locale
+        wrapper = self._makeOne(view, ('locale',), providers)
+        request1 = DummyRequest()
+        request2 = DummyRequest()
+        self.assertEqual(wrapper(None, request1), 1)
+        # a second layer wrapping the same request reuses the cached value
+        wrapper2 = self._makeOne(view, ('locale',), providers)
+        self.assertEqual(wrapper2(None, request1), 1)
+        self.assertEqual(len(calls), 1)
+        # a new request re-resolves the param
+        self.assertEqual(wrapper(None, request2), 2)
+        self.assertEqual(len(calls), 2)
+
+    def test_provider_exception_propagates(self):
+        def provider(request):
+            raise RuntimeError('cannot resolve')
+
+        providers = {'locale': self._makeProvider(provider)}
+        view = lambda context, request, locale=None: 'OK'  # pragma: no cover
+        wrapper = self._makeOne(view, ('locale',), providers)
+        self.assertRaises(RuntimeError, wrapper, None, DummyRequest())
+
+
+class TestRequestParamProviderIntegration(unittest.TestCase):
+    def setUp(self):
+        self.config = testing.setUp()
+
+    def tearDown(self):
+        self.config = None
+        testing.tearDown()
+
+    def _getViewCallable(
+        self, config, ctx_iface=None, request_iface=None, name=''
+    ):
+        from zope.interface import Interface
+
+        from pyramid.interfaces import IView, IViewClassifier
+
+        classifier = IViewClassifier
+        if ctx_iface is None:
+            ctx_iface = Interface
+        if request_iface is None:
+            request_iface = IRequest
+        return config.registry.adapters.lookup(
+            (classifier, request_iface, ctx_iface),
+            IView,
+            name=name,
+            default=None,
+        )
+
+    def _makeRequest(self, config):
+        request = DummyRequest()
+        request.registry = config.registry
+        return request
+
+    def _addLocaleDerivers(self, config, seen):
+        # two derivers that both need the request's locale: one formats
+        # dates, the other formats numbers
+        def localized_date_view(view, info):
+            if not info.options.get('localize_dates'):
+                return view
+
+            def wrapper(context, request, locale=None):
+                seen.append(('date', locale))
+                return view(context, request)
+
+            return wrapper
+
+        localized_date_view.options = ('localize_dates',)
+        localized_date_view.request_params = ('locale',)
+
+        def localized_number_view(view, info):
+            if not info.options.get('localize_numbers'):
+                return view
+
+            def wrapper(context, request, locale=None):
+                seen.append(('number', locale))
+                return view(context, request)
+
+            return wrapper
+
+        localized_number_view.options = ('localize_numbers',)
+        localized_number_view.request_params = ('locale',)
+
+        config.add_view_deriver(localized_date_view, 'localized_date_view')
+        config.add_view_deriver(localized_number_view, 'localized_number_view')
+
+    def test_params_resolved_once_per_request_and_shared_between_layers(self):
+        from pyramid.renderers import null_renderer
+
+        calls = []
+        seen = []
+
+        def locale_provider(request):
+            # a provider with a side effect: it must not be called more
+            # than once per request regardless of deriver wrapping order
+            calls.append(request)
+            return 'zh_CN'
+
+        self.config.add_request_param_provider('locale', locale_provider)
+        self._addLocaleDerivers(self.config, seen)
+        self.config.add_view(
+            lambda context, request: 'OK',
+            localize_dates=True,
+            localize_numbers=True,
+            renderer=null_renderer,
+        )
+        wrapper = self._getViewCallable(self.config)
+
+        request = self._makeRequest(self.config)
+        self.assertEqual(wrapper(None, request), 'OK')
+        # both deriver layers received the same resolved value
+        self.assertEqual(
+            sorted(seen), [('date', 'zh_CN'), ('number', 'zh_CN')]
+        )
+        # the side-effecting provider ran exactly once for this request
+        self.assertEqual(len(calls), 1)
+
+        # the cache is scoped to a single request: a new request resolves
+        # the param again
+        other_request = self._makeRequest(self.config)
+        self.assertEqual(wrapper(None, other_request), 'OK')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], request)
+        self.assertEqual(calls[1], other_request)
+
+    def test_provider_dependencies(self):
+        from pyramid.renderers import null_renderer
+
+        seen = []
+
+        def territory_provider(request):
+            return 'CN'
+
+        def locale_provider(request, territory=None):
+            return 'zh_%s' % territory
+
+        self.config.add_request_param_provider(
+            'territory', territory_provider
+        )
+        self.config.add_request_param_provider(
+            'locale', locale_provider, requires=('territory',)
+        )
+        self._addLocaleDerivers(self.config, seen)
+        self.config.add_view(
+            lambda context, request: 'OK',
+            localize_dates=True,
+            localize_numbers=True,
+            renderer=null_renderer,
+        )
+        wrapper = self._getViewCallable(self.config)
+        request = self._makeRequest(self.config)
+        self.assertEqual(wrapper(None, request), 'OK')
+        self.assertEqual(
+            sorted(seen), [('date', 'zh_CN'), ('number', 'zh_CN')]
+        )
+
+    def test_deriver_declares_unknown_param(self):
+        def deriv(view, info):  # pragma: no cover
+            return view
+
+        deriv.request_params = ('locale',)
+        self.config.add_view_deriver(deriv, 'deriv')
+        self.assertRaises(
+            ConfigurationError,
+            self.config.add_view,
+            lambda context, request: 'OK',
+        )
+
+    def test_provider_requires_unknown_provider(self):
+        self.config.add_request_param_provider(
+            'locale', lambda request: 'zh_CN', requires=('missing',)
+        )
+        self._addLocaleDerivers(self.config, [])
+        # the dependency graph is validated when views are derived
+        self.assertRaises(
+            ConfigurationError,
+            self.config.add_view,
+            lambda context, request: 'OK',
+        )
+
+    def test_provider_cyclic_dependency(self):
+        self.config.add_request_param_provider(
+            'a', lambda request, b: b, requires=('b',)
+        )
+        self.config.add_request_param_provider(
+            'b', lambda request, a: a, requires=('a',)
+        )
+        self._addLocaleDerivers(self.config, [])
+        self.assertRaises(
+            ConfigurationError,
+            self.config.add_view,
+            lambda context, request: 'OK',
+        )
+
+    def test_invalid_param_name(self):
+        self.assertRaises(
+            ConfigurationError,
+            self.config.add_request_param_provider,
+            'not an identifier',
+            lambda request: None,
+        )
+
+    def test_duplicate_provider_conflicts(self):
+        from pyramid.exceptions import ConfigurationConflictError
+        from pyramid.config import Configurator
+
+        config = Configurator(autocommit=False)
+        config.add_request_param_provider('locale', lambda request: 'zh_CN')
+        config.add_request_param_provider('locale', lambda request: 'en_US')
+        self.assertRaises(ConfigurationConflictError, config.commit)
+
+    def test_provider_error_handled_by_exception_view(self):
+        from pyramid.renderers import null_renderer
+        from pyramid.response import Response
+
+        class LocaleError(Exception):
+            pass
+
+        def locale_provider(request):
+            raise LocaleError('unsupported locale')
+
+        seen = []
+
+        def localized_date_view(view, info):
+            if not info.options.get('localize_dates'):
+                return view
+
+            def wrapper(context, request, locale=None):  # pragma: no cover
+                return view(context, request)
+
+            return wrapper
+
+        localized_date_view.options = ('localize_dates',)
+        localized_date_view.request_params = ('locale',)
+
+        self.config.add_request_param_provider('locale', locale_provider)
+        self.config.add_view_deriver(localized_date_view, 'localized_date')
+        self.config.add_view(
+            lambda context, request: Response('OK'),
+            localize_dates=True,
+            renderer=null_renderer,
+        )
+
+        def exception_view(context, request):
+            seen.append(request.exception)
+            return Response('handled')
+
+        self.config.add_exception_view(
+            exception_view, context=LocaleError, renderer=null_renderer
+        )
+        self.config.commit()
+
+        from pyramid.request import Request
+
+        router = self.config.make_wsgi_app()
+        request = Request.blank('/')
+        request.registry = self.config.registry
+        response = router.invoke_request(request)
+        self.assertEqual(response.text, 'handled')
+        self.assertEqual(len(seen), 1)
+        self.assertIsInstance(seen[0], LocaleError)
+
+    def test_predicate_mismatch_does_not_resolve_params(self):
+        from pyramid.exceptions import PredicateMismatch
+        from pyramid.renderers import null_renderer
+
+        calls = []
+
+        def locale_provider(request):  # pragma: no cover
+            calls.append(request)
+            return 'zh_CN'
+
+        seen = []
+        self.config.add_request_param_provider('locale', locale_provider)
+        self._addLocaleDerivers(self.config, seen)
+        self.config.add_view(
+            lambda context, request: 'OK',
+            request_method='POST',
+            localize_dates=True,
+            localize_numbers=True,
+            renderer=null_renderer,
+        )
+        wrapper = self._getViewCallable(self.config)
+        request = self._makeRequest(self.config)
+        request.method = 'GET'
+        self.assertRaises(PredicateMismatch, wrapper, None, request)
+        # the predicate did not match, so the provider was never evaluated
+        self.assertEqual(calls, [])
+        self.assertEqual(seen, [])
+
+
 class TestDeriverIntegration(unittest.TestCase):
     def setUp(self):
         self.config = testing.setUp()

@@ -34,6 +34,7 @@ from pyramid.interfaces import (
     IPackageOverrides,
     IRendererFactory,
     IRequest,
+    IRequestParamProviders,
     IResponse,
     IRouteRequest,
     ISecuredView,
@@ -61,8 +62,11 @@ from pyramid.viewderivers import (
     INGRESS,
     VIEW,
     DefaultViewMapper,
+    RequestParamProvider,
     preserve_view_attrs,
+    request_params_view,
     requestonly,
+    validate_request_param_providers,
     view_description,
     wraps_view,
 )
@@ -1171,8 +1175,40 @@ class ViewsConfiguratorMixin:
         view = info.original_view
         derivers = self.registry.getUtility(IViewDerivers)
         for name, deriver in reversed(outer_derivers + derivers.sorted()):
-            view = wraps_view(deriver)(view, info)
+            derived_view = wraps_view(deriver)(view, info)
+            param_names = getattr(deriver, 'request_params', None)
+            if param_names:
+                providers = self._check_request_params(name, param_names)
+                if derived_view is not view:
+                    # the deriver actually wrapped the view, so resolve
+                    # the declared params and hand them to the deriver
+                    # layer; a deriver that returned the view unchanged
+                    # (e.g. its option was not used) is left alone
+                    derived_view = preserve_view_attrs(
+                        derived_view,
+                        request_params_view(
+                            derived_view, param_names, providers
+                        ),
+                    )
+            view = derived_view
         return view
+
+    def _check_request_params(self, deriver_name, param_names):
+        providers = self.registry.queryUtility(IRequestParamProviders)
+        if providers is None:
+            providers = {}
+        # validate the provider graph at config time so missing
+        # dependencies and cycles are caught before the app runs
+        validate_request_param_providers(providers)
+        for param_name in param_names:
+            if param_name not in providers:
+                raise ConfigurationError(
+                    'View deriver %r declares request param %r but no '
+                    'provider is registered for it; use '
+                    'config.add_request_param_provider(%r, ...) to '
+                    'register one' % (deriver_name, param_name, param_name)
+                )
+        return providers
 
     @action_method
     def add_view_predicate(
@@ -1441,6 +1477,75 @@ class ViewsConfiguratorMixin:
             under='secured_view',
             over='owrapped_view',
         )
+
+    @action_method
+    def add_request_param_provider(self, name, provider, requires=()):
+        """
+        Add a request param provider for use by :term:`view deriver`
+        layers.
+
+        ``name`` is the name of the request param. It must be a valid
+        Python identifier because the resolved value is passed to view
+        deriver layers as a keyword argument. A :term:`view deriver`
+        declares the params it needs via a ``request_params`` attribute
+        containing one or more of these names.
+
+        ``provider`` is a callable accepting ``(request, **deps)`` and
+        returning the value of the param, or a :term:`dotted Python name`
+        referring to such a callable. It is invoked at most once per
+        request, no matter how many deriver layers declare the param -
+        the resolved value is cached on the request and reused by every
+        layer. If the provider raises an exception, it propagates like a
+        normal view exception and may be handled by an :term:`exception
+        view`.
+
+        ``requires`` is an optional iterable of other provider names that
+        this provider depends on. Dependencies are resolved first and
+        passed to the provider as keyword arguments. The names and the
+        dependency graph are validated at configuration time; unknown
+        dependencies and cycles raise
+        :class:`pyramid.exceptions.ConfigurationError`.
+
+        """
+        provider = self.maybe_dotted(provider)
+
+        if not name.isidentifier():
+            raise ConfigurationError(
+                '%r is not a valid request param name; it must be a '
+                'valid Python identifier' % name
+            )
+
+        requires = tuple(requires)
+        for dep in requires:
+            if not isinstance(dep, str) or not dep.isidentifier():
+                raise ConfigurationError(
+                    'Request param provider %r requires invalid '
+                    'provider name %r' % (name, dep)
+                )
+
+        discriminator = ('request param provider', name)
+        intr = self.introspectable(
+            'request param providers', name, name, 'request param provider'
+        )
+        intr['name'] = name
+        intr['provider'] = provider
+        intr['requires'] = requires
+
+        def register():
+            providers = self.registry.queryUtility(IRequestParamProviders)
+            if providers is None:
+                providers = {}
+                self.registry.registerUtility(
+                    providers, IRequestParamProviders
+                )
+            providers[name] = RequestParamProvider(provider, requires)
+
+        self.action(
+            discriminator,
+            register,
+            introspectables=(intr,),
+            order=PHASE1_CONFIG,
+        )  # must be registered before add_view
 
     def derive_view(self, view, attr=None, renderer=None):
         """
