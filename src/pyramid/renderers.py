@@ -1,14 +1,16 @@
 from functools import partial
+import hashlib
 import json
 import os
 import re
+import tempfile
 from zope.interface import implementer, providedBy
 from zope.interface.registry import Components
 
 from pyramid.csrf import get_csrf_token
 from pyramid.decorator import reify
 from pyramid.events import BeforeRender
-from pyramid.httpexceptions import HTTPBadRequest
+from pyramid.httpexceptions import HTTPBadRequest, HTTPNotModified
 from pyramid.interfaces import IJSONAdapter, IRendererFactory, IRendererInfo
 from pyramid.path import caller_package
 from pyramid.response import _get_response_factory
@@ -70,7 +72,12 @@ def render(renderer_name, value, request=None, package=None):
 
 
 def render_to_response(
-    renderer_name, value, request=None, package=None, response=None
+    renderer_name,
+    value,
+    request=None,
+    package=None,
+    response=None,
+    digest=False,
 ):
     """Using the renderer ``renderer_name`` (a template
     or a static renderer), render the value (or set of values) using
@@ -113,6 +120,14 @@ def render_to_response(
        longer the case. If you wish to send in a pre-initialized response
        then you may pass one in the ``response`` argument.
 
+    If ``digest`` is true, the optional digest rendering mode is used: the
+    renderer is executed exactly once and a SHA-256 digest is computed over
+    the actual encoded response bytes.  Small bodies are kept in memory
+    while large bodies are spooled to a temporary file.  The digest is used
+    as the response ``ETag`` (an explicitly set ``ETag`` always takes
+    precedence) and conditional ``GET`` requests carrying a matching
+    ``If-None-Match`` header are answered with ``304 Not Modified``.
+
     """
     try:
         registry = request.registry
@@ -127,7 +142,9 @@ def render_to_response(
     with hide_attrs(request, 'response'):
         if response is not None:
             request.response = response
-        result = helper.render_to_response(value, None, request=request)
+        result = helper.render_to_response(
+            value, None, request=request, digest=digest
+        )
 
     return result
 
@@ -396,6 +413,57 @@ class JSONP(JSON):
         return _render
 
 
+#: Default maximum number of bytes held in memory by the digest rendering
+#: mode before the rendered body is spooled to a temporary file.
+DEFAULT_DIGEST_SPOOL_SIZE = 1024 * 1024
+
+
+def _iter_encoded_chunks(result, charset):
+    """Yield the rendered ``result`` as a sequence of encoded byte chunks."""
+    if isinstance(result, str):
+        yield result.encode(charset)
+    elif isinstance(result, bytes):
+        yield result
+    elif hasattr(result, '__iter__'):
+        for chunk in result:
+            if isinstance(chunk, str):
+                chunk = chunk.encode(charset)
+            yield chunk
+    else:
+        yield result
+
+
+def _close(obj):
+    close = getattr(obj, 'close', None)
+    if close is not None:
+        close()
+
+
+class _SpooledFileIterable:
+    """WSGI iterable which serves the contents of a spooled temporary file.
+
+    Closing the iterable closes the underlying spool, removing the
+    temporary file if the spool rolled over to disk.
+    """
+
+    block_size = 4096 * 64
+
+    def __init__(self, spool):
+        self.spool = spool
+
+    def __iter__(self):
+        read = self.spool.read
+        block_size = self.block_size
+        while True:
+            chunk = read(block_size)
+            if not chunk:
+                break
+            yield chunk
+
+    def close(self):
+        self.spool.close()
+
+
 @implementer(IRendererInfo)
 class RendererHelper:
     def __init__(self, name=None, package=None, registry=None):
@@ -462,19 +530,89 @@ class RendererHelper:
         result = renderer(value, system_values)
         return result
 
-    def render_to_response(self, value, system_values, request=None):
+    def render_to_response(
+        self, value, system_values, request=None, digest=False
+    ):
+        if digest:
+            return self._render_to_response_digest(
+                value, system_values, request=request
+            )
         result = self.render(value, system_values, request=request)
         return self._make_response(result, request)
 
-    def _make_response(self, result, request):
-        # broken out of render_to_response as a separate method for testing
-        # purposes
+    def _render_to_response_digest(
+        self,
+        value,
+        system_values,
+        request=None,
+        spool_size=DEFAULT_DIGEST_SPOOL_SIZE,
+    ):
+        # Render the value exactly once, computing a digest over the actual
+        # encoded bytes as they are produced.  Small bodies are kept in
+        # memory; bodies larger than ``spool_size`` are spooled to a
+        # temporary file.  The digest is used as the response ETag (unless
+        # an explicit ETag was already set, which always wins) and to
+        # answer conditional GET requests with ``304 Not Modified``.
+        response = self._get_response(request)
+        result = self.render(value, system_values, request=request)
+        charset = getattr(response, 'charset', None) or 'utf-8'
+        hasher = hashlib.sha256()
+        spool = tempfile.SpooledTemporaryFile(
+            max_size=spool_size, mode='w+b'
+        )
+        size = 0
+        try:
+            if result is not None:
+                for chunk in _iter_encoded_chunks(result, charset):
+                    hasher.update(chunk)
+                    spool.write(chunk)
+                    size += len(chunk)
+        except BaseException:
+            # a failed render must not leave behind a success response or
+            # a temporary file
+            _close(result)
+            spool.close()
+            raise
+        _close(result)
+
+        if response.etag is None:
+            response.etag = hasher.hexdigest()
+        etag = response.etag
+
+        if_none_match = getattr(request, 'if_none_match', None)
+        if (
+            etag is not None
+            and if_none_match is not None
+            and getattr(request, 'method', 'GET') in ('GET', 'HEAD')
+            and etag in if_none_match
+        ):
+            spool.close()
+            not_modified = HTTPNotModified()
+            not_modified.etag = etag
+            return not_modified
+
+        spool.seek(0)
+        if getattr(spool, '_rolled', False):
+            response.app_iter = _SpooledFileIterable(spool)
+            response.content_length = size
+        else:
+            response.body = spool.read()
+            spool.close()
+        return response
+
+    def _get_response(self, request):
         response = getattr(request, 'response', None)
         if response is None:
             # request is None or request is not a pyramid.response.Response
             registry = self.registry
             response_factory = _get_response_factory(registry)
             response = response_factory(request)
+        return response
+
+    def _make_response(self, result, request):
+        # broken out of render_to_response as a separate method for testing
+        # purposes
+        response = self._get_response(request)
 
         if result is not None:
             if isinstance(result, str):

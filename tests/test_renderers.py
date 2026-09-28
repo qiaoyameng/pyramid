@@ -470,6 +470,231 @@ class TestRendererHelper(unittest.TestCase):
         self.assertRaises(ValueError, getattr, inst, 'renderer')
 
 
+class TestRendererHelperDigest(unittest.TestCase):
+    def setUp(self):
+        self.config = cleanUp()
+
+    def tearDown(self):
+        cleanUp()
+
+    def _makeOne(self, *arg, **kw):
+        from pyramid.renderers import RendererHelper
+
+        return RendererHelper(*arg, **kw)
+
+    def _registerRenderer(self, func):
+        from pyramid.interfaces import IRendererFactory
+
+        self.config.registry.registerUtility(
+            lambda info: func, IRendererFactory, name='.foo'
+        )
+
+    def _makeRequest(self, **kw):
+        from pyramid.request import Request
+
+        request = Request.blank('/', **kw)
+        request.registry = self.config.registry
+        return request
+
+    def _trackSpools(self):
+        from unittest import mock
+
+        from pyramid import renderers
+
+        spools = []
+        real_spool = renderers.tempfile.SpooledTemporaryFile
+
+        def tracking_spool(**kw):
+            spool = real_spool(**kw)
+            spools.append(spool)
+            return spool
+
+        patcher = mock.patch.object(
+            renderers.tempfile, 'SpooledTemporaryFile', tracking_spool
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return spools
+
+    def test_str_result_non_ascii(self):
+        import hashlib
+
+        text = 'héllo wörld'
+        self._registerRenderer(lambda value, system: text)
+        request = self._makeRequest()
+        helper = self._makeOne('loo.foo')
+        response = helper.render_to_response(
+            'v', {}, request=request, digest=True
+        )
+        body = text.encode('utf-8')
+        self.assertEqual(response.status, '200 OK')
+        self.assertEqual(response.body, body)
+        self.assertEqual(response.etag, hashlib.sha256(body).hexdigest())
+
+    def test_bytes_result(self):
+        import hashlib
+
+        body = 'héllo'.encode('utf-8')
+        self._registerRenderer(lambda value, system: body)
+        request = self._makeRequest()
+        helper = self._makeOne('loo.foo')
+        response = helper.render_to_response(
+            'v', {}, request=request, digest=True
+        )
+        self.assertEqual(response.body, body)
+        self.assertEqual(response.etag, hashlib.sha256(body).hexdigest())
+
+    def test_generator_result_consumed_exactly_once(self):
+        import hashlib
+
+        produced = []
+        closed = []
+
+        def gen():
+            try:
+                for chunk in ['héllo ', 'wörld'.encode('utf-8'), ' again']:
+                    produced.append(chunk)
+                    yield chunk
+            finally:
+                closed.append(True)
+
+        self._registerRenderer(lambda value, system: gen())
+        request = self._makeRequest()
+        helper = self._makeOne('loo.foo')
+        response = helper.render_to_response(
+            'v', {}, request=request, digest=True
+        )
+        body = 'héllo wörld again'.encode('utf-8')
+        self.assertEqual(response.body, body)
+        self.assertEqual(response.etag, hashlib.sha256(body).hexdigest())
+        self.assertEqual(len(produced), 3)
+        self.assertEqual(closed, [True])
+
+    def test_small_result_stays_in_memory(self):
+        spools = self._trackSpools()
+        self._registerRenderer(lambda value, system: b'abc')
+        request = self._makeRequest()
+        helper = self._makeOne('loo.foo')
+        response = helper._render_to_response_digest(
+            'v', {}, request=request, spool_size=1024
+        )
+        self.assertEqual(response.body, b'abc')
+        self.assertEqual(len(spools), 1)
+        self.assertFalse(spools[0]._rolled)
+        self.assertTrue(spools[0]._file.closed)
+
+    def test_large_result_spooled_to_temp_file(self):
+        body = b'x' * 100
+        self._registerRenderer(lambda value, system: iter([body]))
+        request = self._makeRequest()
+        helper = self._makeOne('loo.foo')
+        response = helper._render_to_response_digest(
+            'v', {}, request=request, spool_size=4
+        )
+        app_iter = response.app_iter
+        self.assertTrue(app_iter.spool._rolled)
+        self.assertEqual(response.content_length, len(body))
+        self.assertEqual(b''.join(app_iter), body)
+        app_iter.close()
+        self.assertTrue(app_iter.spool._file.closed)
+
+    def test_render_error_leaves_no_response_or_temp_file(self):
+        spools = self._trackSpools()
+        closed = []
+
+        def gen():
+            try:
+                yield b'x' * 100
+                raise RuntimeError('boom')
+            finally:
+                closed.append(True)
+
+        self._registerRenderer(lambda value, system: gen())
+        request = self._makeRequest()
+        helper = self._makeOne('loo.foo')
+        with self.assertRaises(RuntimeError):
+            helper._render_to_response_digest(
+                'v', {}, request=request, spool_size=4
+            )
+        self.assertEqual(len(spools), 1)
+        self.assertTrue(spools[0]._rolled)
+        self.assertTrue(spools[0]._file.closed)
+        self.assertEqual(closed, [True])
+
+    def test_explicit_etag_takes_precedence_over_digest(self):
+        request = self._makeRequest()
+
+        def render(value, system):
+            request.response.etag = 'explicit'
+            return 'abc'
+
+        self._registerRenderer(render)
+        helper = self._makeOne('loo.foo')
+        response = helper.render_to_response(
+            'v', {}, request=request, digest=True
+        )
+        self.assertEqual(response.etag, 'explicit')
+        self.assertEqual(response.body, b'abc')
+
+    def test_if_none_match_returns_304_and_closes_spool(self):
+        import hashlib
+
+        body = b'x' * 100
+        etag = hashlib.sha256(body).hexdigest()
+        spools = self._trackSpools()
+        self._registerRenderer(lambda value, system: iter([body]))
+        request = self._makeRequest(headers={'If-None-Match': f'"{etag}"'})
+        helper = self._makeOne('loo.foo')
+        response = helper._render_to_response_digest(
+            'v', {}, request=request, spool_size=4
+        )
+        self.assertEqual(response.status, '304 Not Modified')
+        self.assertEqual(response.etag, etag)
+        self.assertEqual(len(spools), 1)
+        self.assertTrue(spools[0]._file.closed)
+
+    def test_if_none_match_against_explicit_etag_returns_304(self):
+        request = self._makeRequest(headers={'If-None-Match': '"explicit"'})
+
+        def render(value, system):
+            request.response.etag = 'explicit'
+            return 'abc'
+
+        self._registerRenderer(render)
+        helper = self._makeOne('loo.foo')
+        response = helper.render_to_response(
+            'v', {}, request=request, digest=True
+        )
+        self.assertEqual(response.status, '304 Not Modified')
+        self.assertEqual(response.etag, 'explicit')
+
+    def test_if_none_match_mismatch_returns_200(self):
+        self._registerRenderer(lambda value, system: 'abc')
+        request = self._makeRequest(headers={'If-None-Match': '"nope"'})
+        helper = self._makeOne('loo.foo')
+        response = helper.render_to_response(
+            'v', {}, request=request, digest=True
+        )
+        self.assertEqual(response.status, '200 OK')
+        self.assertEqual(response.body, b'abc')
+
+    def test_if_none_match_ignored_for_non_get(self):
+        import hashlib
+
+        body = b'abc'
+        etag = hashlib.sha256(body).hexdigest()
+        self._registerRenderer(lambda value, system: body)
+        request = self._makeRequest(
+            method='POST', headers={'If-None-Match': f'"{etag}"'}
+        )
+        helper = self._makeOne('loo.foo')
+        response = helper.render_to_response(
+            'v', {}, request=request, digest=True
+        )
+        self.assertEqual(response.status, '200 OK')
+        self.assertEqual(response.body, body)
+
+
 class TestNullRendererHelper(unittest.TestCase):
     def setUp(self):
         self.config = cleanUp()
@@ -670,6 +895,20 @@ class Test_render_to_response(unittest.TestCase):
         self.assertTrue(result is response)
         self.assertEqual(result.body, b'{"a": 1}')
         self.assertFalse('response' in request.__dict__)
+
+    def test_digest_mode(self):
+        import hashlib
+
+        from pyramid.renderers import render_to_response
+
+        renderer = self.config.testing_add_renderer('tests:abc/def.pt')
+        renderer.string_response = 'abc'
+        request = testing.DummyRequest()
+        response = render_to_response(
+            'abc/def.pt', dict(a=1), request=request, digest=True
+        )
+        self.assertEqual(response.body, b'abc')
+        self.assertEqual(response.etag, hashlib.sha256(b'abc').hexdigest())
 
 
 class Test_get_renderer(unittest.TestCase):
