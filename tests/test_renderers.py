@@ -470,6 +470,239 @@ class TestRendererHelper(unittest.TestCase):
         self.assertRaises(ValueError, getattr, inst, 'renderer')
 
 
+class TestRendererHelperDigest(unittest.TestCase):
+    def setUp(self):
+        self.config = cleanUp()
+
+    def tearDown(self):
+        cleanUp()
+
+    def _makeOne(self, *arg, **kw):
+        from pyramid.renderers import RendererHelper
+
+        return RendererHelper(*arg, **kw)
+
+    def _makeRequest(self, **kw):
+        from pyramid.request import Request
+
+        request = Request.blank('/', **kw)
+        request.registry = self.config.registry
+        return request
+
+    def _digest(self, data):
+        import hashlib
+
+        return hashlib.sha256(data).hexdigest()
+
+    def _spyOnSpool(self):
+        import pyramid.renderers
+
+        spools = []
+        factory = pyramid.renderers.tempfile.SpooledTemporaryFile
+
+        def make_spool(*arg, **kw):
+            spool = factory(*arg, **kw)
+            spools.append(spool)
+            return spool
+
+        pyramid.renderers.tempfile.SpooledTemporaryFile = make_spool
+        self.addCleanup(
+            setattr,
+            pyramid.renderers.tempfile,
+            'SpooledTemporaryFile',
+            factory,
+        )
+        return spools
+
+    def test_digest_result_is_non_ascii_str(self):
+        request = self._makeRequest()
+        helper = self._makeOne('loo.foo')
+        la = text_('/La Pe\xc3\xb1a', 'utf-8')
+        response = helper._make_response(la, request, digest_etag=True)
+        self.assertEqual(response.body, la.encode('utf-8'))
+        self.assertEqual(response.etag, self._digest(la.encode('utf-8')))
+        self.assertEqual(response.status_code, 200)
+
+    def test_digest_result_is_bytes(self):
+        request = self._makeRequest()
+        helper = self._makeOne('loo.foo')
+        response = helper._make_response(b'abc', request, digest_etag=True)
+        self.assertEqual(response.body, b'abc')
+        self.assertEqual(response.etag, self._digest(b'abc'))
+
+    def test_digest_result_is_one_shot_generator(self):
+        chunks = [b'ab', text_('/La Pe\xc3\xb1a', 'utf-8')]
+        iterations = []
+
+        def generate():
+            iterations.append(True)
+            yield from chunks
+
+        request = self._makeRequest()
+        helper = self._makeOne('loo.foo')
+        response = helper._make_response(
+            generate(), request, digest_etag=True
+        )
+        encoded = b'ab' + chunks[1].encode('utf-8')
+        self.assertEqual(response.body, encoded)
+        self.assertEqual(response.etag, self._digest(encoded))
+        # the generator was consumed exactly once
+        self.assertEqual(iterations, [True])
+
+    def test_digest_large_result_uses_temp_file(self):
+        import pyramid.renderers
+
+        self.addCleanup(
+            setattr,
+            pyramid.renderers,
+            '_DIGEST_SPOOL_MAX_SIZE',
+            pyramid.renderers._DIGEST_SPOOL_MAX_SIZE,
+        )
+        pyramid.renderers._DIGEST_SPOOL_MAX_SIZE = 10
+        data = b'x' * 11
+        request = self._makeRequest()
+        helper = self._makeOne('loo.foo')
+        response = helper._make_response(
+            iter([data]), request, digest_etag=True
+        )
+        self.assertEqual(response.etag, self._digest(data))
+        self.assertEqual(response.content_length, len(data))
+        app_iter = response.app_iter
+        self.assertEqual(app_iter.__class__.__name__, '_ClosingFileIterator')
+        self.assertEqual(b''.join(app_iter), data)
+        # exhausting the iterator closed the temporary file
+        self.assertTrue(app_iter.file.closed)
+
+    def test_digest_large_result_app_iter_close_closes_file(self):
+        import pyramid.renderers
+
+        self.addCleanup(
+            setattr,
+            pyramid.renderers,
+            '_DIGEST_SPOOL_MAX_SIZE',
+            pyramid.renderers._DIGEST_SPOOL_MAX_SIZE,
+        )
+        pyramid.renderers._DIGEST_SPOOL_MAX_SIZE = 10
+        request = self._makeRequest()
+        helper = self._makeOne('loo.foo')
+        response = helper._make_response(
+            iter([b'x' * 11]), request, digest_etag=True
+        )
+        response.app_iter.close()
+        self.assertTrue(response.app_iter.file.closed)
+
+    def test_digest_conditional_get_returns_304(self):
+        etag = self._digest(b'abc')
+        request = self._makeRequest(headers={'If-None-Match': '"%s"' % etag})
+        closed = []
+
+        def generate():
+            try:
+                yield b'abc'
+            finally:
+                closed.append(True)
+
+        helper = self._makeOne('loo.foo')
+        response = helper._make_response(
+            generate(), request, digest_etag=True
+        )
+        self.assertEqual(response.status_code, 304)
+        self.assertEqual(response.body, b'')
+        self.assertEqual(response.etag, etag)
+        # the 304 branch closed the exhausted generator
+        self.assertEqual(closed, [True])
+
+    def test_digest_conditional_get_304_closes_spool(self):
+        spools = self._spyOnSpool()
+        etag = self._digest(b'abc')
+        request = self._makeRequest(headers={'If-None-Match': '"%s"' % etag})
+        helper = self._makeOne('loo.foo')
+        response = helper._make_response(b'abc', request, digest_etag=True)
+        self.assertEqual(response.status_code, 304)
+        self.assertEqual(len(spools), 1)
+        self.assertTrue(spools[0].closed)
+
+    def test_digest_conditional_get_non_matching_etag_returns_200(self):
+        request = self._makeRequest(headers={'If-None-Match': '"stale"'})
+        helper = self._makeOne('loo.foo')
+        response = helper._make_response(b'abc', request, digest_etag=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.body, b'abc')
+        self.assertEqual(response.etag, self._digest(b'abc'))
+
+    def test_digest_conditional_get_ignores_non_get_methods(self):
+        etag = self._digest(b'abc')
+        request = self._makeRequest(headers={'If-None-Match': '"%s"' % etag})
+        request.method = 'POST'
+        helper = self._makeOne('loo.foo')
+        response = helper._make_response(b'abc', request, digest_etag=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.body, b'abc')
+
+    def test_digest_explicit_etag_takes_precedence(self):
+        request = self._makeRequest(headers={'If-None-Match': '"explicit"'})
+        request.response.etag = 'explicit'
+        helper = self._makeOne('loo.foo')
+        response = helper._make_response(b'abc', request, digest_etag=True)
+        # the explicit etag, not the digest, drove the 304 decision
+        self.assertEqual(response.status_code, 304)
+        self.assertEqual(response.etag, 'explicit')
+
+    def test_digest_explicit_etag_not_overwritten(self):
+        request = self._makeRequest()
+        request.response.etag = 'explicit'
+        helper = self._makeOne('loo.foo')
+        response = helper._make_response(b'abc', request, digest_etag=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.etag, 'explicit')
+        self.assertEqual(response.body, b'abc')
+
+    def test_digest_streaming_error_cleans_up(self):
+        spools = self._spyOnSpool()
+        closed = []
+
+        def generate():
+            try:
+                yield b'partial'
+                raise ValueError('boom')
+            finally:
+                closed.append(True)
+
+        request = self._makeRequest()
+        helper = self._makeOne('loo.foo')
+        self.assertRaises(
+            ValueError,
+            helper._make_response,
+            generate(),
+            request,
+            digest_etag=True,
+        )
+        # no successful response, no temporary file, no open generator
+        self.assertEqual(len(spools), 1)
+        self.assertTrue(spools[0].closed)
+        self.assertEqual(closed, [True])
+
+    def test_render_to_response_with_digest_etag(self):
+        from pyramid.interfaces import IRendererFactory
+
+        def renderer(*arg):
+            def respond(*arg):
+                return 'abc'
+
+            return respond
+
+        self.config.registry.registerUtility(
+            renderer, IRendererFactory, name='.foo'
+        )
+        request = self._makeRequest()
+        helper = self._makeOne('loo.foo')
+        response = helper.render_to_response(
+            'values', {}, request=request, digest_etag=True
+        )
+        self.assertEqual(response.body, b'abc')
+        self.assertEqual(response.etag, self._digest(b'abc'))
+
+
 class TestNullRendererHelper(unittest.TestCase):
     def setUp(self):
         self.config = cleanUp()
@@ -670,6 +903,23 @@ class Test_render_to_response(unittest.TestCase):
         self.assertTrue(result is response)
         self.assertEqual(result.body, b'{"a": 1}')
         self.assertFalse('response' in request.__dict__)
+
+    def test_it_with_digest_etag(self):
+        import hashlib
+
+        from pyramid.renderers import render_to_response
+
+        renderer = self.config.testing_add_renderer('tests:abc/def.pt')
+        renderer.string_response = 'abc'
+        request = testing.DummyRequest()
+        response = render_to_response(
+            'abc/def.pt',
+            dict(a=1),
+            request=request,
+            digest_etag=True,
+        )
+        self.assertEqual(response.body, b'abc')
+        self.assertEqual(response.etag, hashlib.sha256(b'abc').hexdigest())
 
 
 class Test_get_renderer(unittest.TestCase):

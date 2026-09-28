@@ -1,7 +1,9 @@
 from functools import partial
+import hashlib
 import json
 import os
 import re
+import tempfile
 from zope.interface import implementer, providedBy
 from zope.interface.registry import Components
 
@@ -70,7 +72,12 @@ def render(renderer_name, value, request=None, package=None):
 
 
 def render_to_response(
-    renderer_name, value, request=None, package=None, response=None
+    renderer_name,
+    value,
+    request=None,
+    package=None,
+    response=None,
+    digest_etag=False,
 ):
     """Using the renderer ``renderer_name`` (a template
     or a static renderer), render the value (or set of values) using
@@ -113,6 +120,18 @@ def render_to_response(
        longer the case. If you wish to send in a pre-initialized response
        then you may pass one in the ``response`` argument.
 
+    If ``digest_etag`` is true, the rendered output is buffered exactly
+    once (small outputs in memory, large outputs in a temporary file)
+    while a digest of the actually-encoded response bytes is computed.
+    Unless the response already carries an explicit ``ETag`` header
+    (which always takes precedence), the digest is used as the
+    response's ``ETag``.  When the request supplies a matching
+    ``If-None-Match`` header, a ``304 Not Modified`` response is
+    returned instead of the body, and any buffered resources are
+    closed.  See
+    :meth:`pyramid.renderers.RendererHelper.render_to_response` for the
+    full semantics of this mode.
+
     """
     try:
         registry = request.registry
@@ -127,7 +146,9 @@ def render_to_response(
     with hide_attrs(request, 'response'):
         if response is not None:
             request.response = response
-        result = helper.render_to_response(value, None, request=request)
+        result = helper.render_to_response(
+            value, None, request=request, digest_etag=digest_etag
+        )
 
     return result
 
@@ -396,6 +417,67 @@ class JSONP(JSON):
         return _render
 
 
+# Digest rendering mode: outputs at or below this size are kept in
+# memory; larger outputs are rolled over into a temporary file.
+_DIGEST_SPOOL_MAX_SIZE = 1024 * 1024  # 1 MB
+
+_DIGEST_BLOCK_SIZE = 64 * 1024
+
+
+def _iter_encoded_chunks(result, response):
+    # Yield the response body as a sequence of encoded byte chunks,
+    # exactly as they will be sent to the client.
+    charset = getattr(response, 'charset', None) or 'utf-8'
+    if isinstance(result, str):
+        yield result.encode(charset)
+    elif isinstance(result, bytes):
+        yield result
+    elif hasattr(result, '__iter__'):
+        for chunk in result:
+            if isinstance(chunk, str):
+                chunk = chunk.encode(charset)
+            elif not isinstance(chunk, bytes):
+                chunk = bytes(chunk)
+            yield chunk
+    else:
+        yield bytes(result)
+
+
+def _etag_matches(request, etag):
+    # True when the request is a conditional GET/HEAD whose
+    # If-None-Match header matches ``etag`` (an unquoted etag value).
+    if request is None:
+        return False
+    if getattr(request, 'method', 'GET') not in ('GET', 'HEAD'):
+        return False
+    if_none_match = getattr(request, 'if_none_match', None)
+    if if_none_match is None:
+        return False
+    return etag in if_none_match
+
+
+class _ClosingFileIterator:
+    """Iterate over a file object in blocks, closing it when the
+    iterator is exhausted or explicitly closed by the WSGI server."""
+
+    def __init__(self, file, block_size=_DIGEST_BLOCK_SIZE):
+        self.file = file
+        self.block_size = block_size
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        chunk = self.file.read(self.block_size)
+        if not chunk:
+            self.file.close()
+            raise StopIteration
+        return chunk
+
+    def close(self):
+        self.file.close()
+
+
 @implementer(IRendererInfo)
 class RendererHelper:
     def __init__(self, name=None, package=None, registry=None):
@@ -462,11 +544,13 @@ class RendererHelper:
         result = renderer(value, system_values)
         return result
 
-    def render_to_response(self, value, system_values, request=None):
+    def render_to_response(
+        self, value, system_values, request=None, digest_etag=False
+    ):
         result = self.render(value, system_values, request=request)
-        return self._make_response(result, request)
+        return self._make_response(result, request, digest_etag=digest_etag)
 
-    def _make_response(self, result, request):
+    def _make_response(self, result, request, digest_etag=False):
         # broken out of render_to_response as a separate method for testing
         # purposes
         response = getattr(request, 'response', None)
@@ -475,6 +559,9 @@ class RendererHelper:
             registry = self.registry
             response_factory = _get_response_factory(registry)
             response = response_factory(request)
+
+        if digest_etag and result is not None:
+            return self._make_digest_response(result, request, response)
 
         if result is not None:
             if isinstance(result, str):
@@ -486,6 +573,58 @@ class RendererHelper:
             else:
                 response.body = result
 
+        return response
+
+    def _make_digest_response(self, result, request, response):
+        # Buffer the rendered output exactly once, computing a digest of
+        # the actually-encoded bytes as they stream by.  Small outputs
+        # stay in memory; outputs larger than the spool threshold are
+        # rolled over into a temporary file.  Only then do we decide,
+        # based on the effective ETag and the request's conditional
+        # headers, whether to return the body (200) or not (304).
+        spool = tempfile.SpooledTemporaryFile(
+            max_size=_DIGEST_SPOOL_MAX_SIZE
+        )
+        hasher = hashlib.sha256()
+        size = 0
+        close_result = getattr(result, 'close', None)
+        try:
+            for chunk in _iter_encoded_chunks(result, response):
+                hasher.update(chunk)
+                spool.write(chunk)
+                size += len(chunk)
+        except Exception:
+            # A streaming renderer that fails midway must not leave
+            # behind a successful response or a temporary file.
+            spool.close()
+            if close_result is not None:
+                close_result()
+            raise
+
+        if close_result is not None:
+            close_result()
+
+        # An ETag set explicitly on the response takes precedence over
+        # the computed digest, both as the response header and as the
+        # value compared against the request's conditional headers.
+        etag = getattr(response, 'etag', None)
+        if etag is None:
+            etag = hasher.hexdigest()
+            response.etag = etag
+
+        if _etag_matches(request, etag):
+            spool.close()
+            response.status_code = 304
+            response.body = b''
+            return response
+
+        spool.seek(0)
+        if size <= _DIGEST_SPOOL_MAX_SIZE:
+            response.body = spool.read()
+            spool.close()
+        else:
+            response.app_iter = _ClosingFileIterator(spool)
+            response.content_length = size
         return response
 
     def clone(self, name=None, package=None, registry=None):
