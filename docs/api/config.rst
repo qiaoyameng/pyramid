@@ -73,6 +73,7 @@
      .. automethod:: add_subscriber_predicate
      .. automethod:: add_view_predicate
      .. automethod:: add_view_deriver
+     .. automethod:: add_request_argument_provider
      .. automethod:: set_execution_policy
      .. automethod:: set_request_factory
      .. automethod:: set_root_factory

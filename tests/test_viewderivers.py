@@ -2041,6 +2041,300 @@ class TestDeriverIntegration(unittest.TestCase):
         )
 
 
+class TestRequestArguments(unittest.TestCase):
+    """Request argument providers for view derivers.
+
+    Two demonstration derivers both need request "region" information:
+    ``region_tagged_view`` stamps a response header with the region and
+    ``region_audit_view`` records the region alongside the view name.
+    """
+
+    def setUp(self):
+        self.config = testing.setUp()
+        self.calls = 0
+        self.audit = []
+
+    def tearDown(self):
+        self.config = None
+        testing.tearDown()
+
+    def _makeRequest(self, region='cn-north'):
+        from pyramid.response import Response
+
+        request = DummyRequest()
+        request.registry = self.config.registry
+        request.method = 'GET'
+        if region is not None:
+            request.headers['X-Region'] = region
+        request.response = Response()
+        return request
+
+    def _region_provider(self, request):
+        # a provider with side effects: it must run at most once per
+        # request even if several deriver layers consume it
+        self.calls += 1
+        return request.headers.get('X-Region', 'unknown')
+
+    def _add_region_provider(self):
+        self.config.add_request_argument_provider(
+            'region', self._region_provider
+        )
+
+    def _register_region_derivers(self, tag=True, audit=True):
+        def region_tagged_view(view, info):
+            if info.exception_only:
+                return view
+
+            def wrapper(context, request, region):
+                response = view(context, request)
+                response.headers['X-Region'] = region
+                return response
+
+            return wrapper
+
+        region_tagged_view.request_arguments = ('region',)
+
+        def region_audit_view(view, info):
+            if info.exception_only:
+                return view
+            seen = self.audit
+
+            def wrapper(context, request, region):
+                seen.append((getattr(view, '__name__', None), region))
+                return view(context, request)
+
+            return wrapper
+
+        region_audit_view.request_arguments = ('region',)
+
+        if tag:
+            self.config.add_view_deriver(
+                region_tagged_view, name='region_tagged_view'
+            )
+        if audit:
+            self.config.add_view_deriver(
+                region_audit_view, name='region_audit_view'
+            )
+
+    def _getViewCallable(self, config, name=''):
+        from zope.interface import Interface
+
+        from pyramid.interfaces import IView, IViewClassifier
+
+        return config.registry.adapters.lookup(
+            (IViewClassifier, IRequest, Interface),
+            IView,
+            name=name,
+            default=None,
+        )
+
+    def test_two_derivers_share_one_provider_call_per_request(self):
+        from pyramid.response import Response
+
+        def view(request):
+            return Response('hello')
+
+        self._add_region_provider()
+        self._register_region_derivers()
+        self.config.add_view(view)
+        self.config.commit()
+
+        wrapper = self._getViewCallable(self.config)
+        request = self._makeRequest(region='eu-west')
+        response = wrapper(None, request)
+
+        self.assertEqual(response.headers['X-Region'], 'eu-west')
+        self.assertEqual(self.calls, 1)
+        self.assertEqual([region for _, region in self.audit], ['eu-west'])
+
+    def test_cache_is_scoped_to_a_single_request(self):
+        from pyramid.response import Response
+
+        def view(request):
+            return Response('hello')
+
+        self._add_region_provider()
+        self._register_region_derivers()
+        self.config.add_view(view)
+        self.config.commit()
+
+        wrapper = self._getViewCallable(self.config)
+
+        first = self._makeRequest(region='cn-north')
+        wrapper(None, first)
+        self.assertEqual(self.calls, 1)
+
+        # a second request recomputes the provider; the cache does not
+        # leak across requests
+        second = self._makeRequest(region='us-south')
+        response = wrapper(None, second)
+        self.assertEqual(self.calls, 2)
+        self.assertEqual(response.headers['X-Region'], 'us-south')
+
+        # rerunning within the same request is free
+        from pyramid.viewderivers import resolve_request_argument
+
+        again = resolve_request_argument(second, second.registry, 'region')
+        self.assertEqual(again, 'us-south')
+        self.assertEqual(self.calls, 2)
+
+    def test_provider_failure_goes_through_exception_views(self):
+        from pyramid.request import Request
+        from pyramid.response import Response
+
+        class BadRegion(Exception):
+            pass
+
+        def failing_provider(request):
+            self.calls += 1
+            raise BadRegion('bad region header')
+
+        def view(request):  # pragma: no cover
+            return Response('hello')
+
+        def error_view(exc, request):
+            return Response('bad region: %s' % exc, status=400)
+
+        self.config.add_route('home', '/')
+        self.config.add_request_argument_provider('region', failing_provider)
+        self._register_region_derivers()
+        self.config.add_view(view, route_name='home')
+        self.config.add_view(error_view, context=BadRegion)
+        app = self.config.make_wsgi_app()
+
+        request = Request.blank('/', headers={'X-Region': 'mars'})
+        response = request.get_response(app)
+        self.assertEqual(response.status_int, 400)
+        self.assertIn(b'bad region', response.body)
+        self.assertEqual(self.calls, 1)
+
+    def test_provider_not_evaluated_on_predicate_mismatch(self):
+        from pyramid.response import Response
+
+        def view(request):  # pragma: no cover
+            return Response('hello')
+
+        self._add_region_provider()
+        self._register_region_derivers()
+        # POST-only view; the predicated layer sits outside the request
+        # argument layers so a mismatch never resolves arguments
+        self.config.add_view(view, request_method='POST')
+        self.config.commit()
+
+        wrapper = self._getViewCallable(self.config)
+        request = self._makeRequest(region='cn-north')
+        from pyramid.exceptions import PredicateMismatch
+
+        self.assertRaises(PredicateMismatch, wrapper, None, request)
+        self.assertEqual(self.calls, 0)
+
+    def test_unknown_argument_is_a_configuration_error(self):
+        self._register_region_derivers()
+        # no provider registered for "region"
+
+        self.assertRaises(
+            ConfigurationError,
+            lambda: self.config.add_view(lambda r: {}),
+        )
+
+    def test_unknown_dependency_is_a_configuration_error(self):
+        self.config.add_request_argument_provider(
+            'region', self._region_provider, requires='locale'
+        )
+        self._register_region_derivers(tag=False)
+
+        self.assertRaises(
+            ConfigurationError,
+            lambda: self.config.add_view(lambda r: {}),
+        )
+
+    def test_cyclic_dependencies_are_a_configuration_error(self):
+        self.config.add_request_argument_provider(
+            'region', self._region_provider, requires='locale'
+        )
+        self.config.add_request_argument_provider(
+            'locale', lambda request, region=None: 'en', requires='region'
+        )
+        self._register_region_derivers(tag=False)
+
+        self.assertRaises(
+            ConfigurationError,
+            lambda: self.config.add_view(lambda r: {}),
+        )
+
+    def test_dependency_provider_receives_resolved_values_in_order(self):
+        from pyramid.response import Response
+
+        order = []
+
+        def region_provider(request):
+            order.append('region')
+            return 'cn-north'
+
+        def region_label_provider(request, region):
+            order.append('label')
+            return 'north-china:%s' % region
+
+        captured = []
+
+        def labeled_view(view, info):
+            def wrapper(context, request, region_label):
+                captured.append(region_label)
+                return view(context, request)
+
+            return wrapper
+
+        labeled_view.request_arguments = ('region_label',)
+
+        self.config.add_request_argument_provider('region', region_provider)
+        self.config.add_request_argument_provider(
+            'region_label', region_label_provider, requires='region'
+        )
+        self.config.add_view_deriver(labeled_view, name='labeled_view')
+        self.config.add_view(lambda r: Response('ok'))
+        self.config.commit()
+
+        wrapper = self._getViewCallable(self.config)
+        request = self._makeRequest()
+        wrapper(None, request)
+
+        self.assertEqual(order, ['region', 'label'])
+        self.assertEqual(captured, ['north-china:cn-north'])
+
+    def test_invalid_provider_name_is_rejected(self):
+        self.assertRaises(
+            ConfigurationError,
+            self.config.add_request_argument_provider,
+            'not-an-identifier',
+            self._region_provider,
+        )
+
+    def test_deriver_opting_out_does_not_resolve_arguments(self):
+        from pyramid.response import Response
+
+        self._add_region_provider()
+
+        def sometimes_view(view, info):
+            if not info.options.get('need_region'):
+                return view
+
+            def wrapper(context, request, region):
+                return view(context, request)
+
+            return wrapper
+
+        sometimes_view.request_arguments = ('region',)
+        sometimes_view.options = ('need_region',)
+
+        self.config.add_view_deriver(sometimes_view, name='sometimes_view')
+        self.config.add_view(lambda r: Response('ok'), need_region=False)
+        self.config.commit()
+
+        wrapper = self._getViewCallable(self.config)
+        wrapper(None, self._makeRequest())
+        self.assertEqual(self.calls, 0)
+
+
 @implementer(IResponse)
 class DummyResponse:
     content_type = None

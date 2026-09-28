@@ -110,6 +110,9 @@ Other Interfaces
   .. autointerface:: IViewDeriver
      :members:
 
+  .. autointerface:: IRequestArgumentProviders
+     :members:
+
   .. autointerface:: IViewDeriverInfo
      :members:
 

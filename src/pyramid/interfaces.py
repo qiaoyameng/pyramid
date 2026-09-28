@@ -1554,6 +1554,16 @@ class IViewDeriver(Interface):
         'This attribute is optional.'
     )
 
+    request_arguments = Attribute(
+        'A list of request argument names required by this deriver. '
+        'Each name must have a matching provider registered via '
+        ':meth:`pyramid.config.Configurator.add_request_argument_provider`. '
+        'If this attribute is set, the wrapper returned by the deriver '
+        'will be invoked with the resolved arguments as extra keyword '
+        'arguments, resolved at most once per request. '
+        'This attribute is optional.'
+    )
+
     def __call__(view, info):
         """
         Derive a new view from the supplied view.
@@ -1564,6 +1574,12 @@ class IViewDeriver(Interface):
         The ``view`` is a callable accepting ``(context, request)``.
 
         """
+
+
+class IRequestArgumentProviders(Interface):
+    """Interface for the mapping of named request argument providers
+    registered via
+    :meth:`pyramid.config.Configurator.add_request_argument_provider`."""
 
 
 class IViewDeriverInfo(Interface):

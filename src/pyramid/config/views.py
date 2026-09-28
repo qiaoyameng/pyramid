@@ -34,6 +34,7 @@ from pyramid.interfaces import (
     IPackageOverrides,
     IRendererFactory,
     IRequest,
+    IRequestArgumentProviders,
     IResponse,
     IRouteRequest,
     ISecuredView,
@@ -61,8 +62,12 @@ from pyramid.viewderivers import (
     INGRESS,
     VIEW,
     DefaultViewMapper,
+    RequestArgumentProvider,
+    inject_request_arguments,
     preserve_view_attrs,
+    request_arguments,
     requestonly,
+    validate_request_arguments,
     view_description,
     wraps_view,
 )
@@ -1170,7 +1175,23 @@ class ViewsConfiguratorMixin:
 
         view = info.original_view
         derivers = self.registry.getUtility(IViewDerivers)
-        for name, deriver in reversed(outer_derivers + derivers.sorted()):
+        ordered_derivers = outer_derivers + derivers.sorted()
+
+        # validate request arguments at configuration time: every declared
+        # argument must have a registered provider, and provider dependencies
+        # must resolve without cycles
+        providers = self.registry.queryUtility(IRequestArgumentProviders)
+        required_args = []
+        for name, deriver in ordered_derivers:
+            for arg in request_arguments(deriver):
+                if arg not in required_args:
+                    required_args.append(arg)
+        validate_request_arguments(providers, required_args)
+
+        for name, deriver in reversed(ordered_derivers):
+            arg_names = request_arguments(deriver)
+            if arg_names:
+                deriver = inject_request_arguments(deriver, arg_names)
             view = wraps_view(deriver)(view, info)
         return view
 
@@ -1409,6 +1430,80 @@ class ViewsConfiguratorMixin:
                 )
                 self.registry.registerUtility(derivers, IViewDerivers)
             derivers.add(name, deriver, before=over, after=under)
+
+        self.action(
+            discriminator,
+            register,
+            introspectables=(intr,),
+            order=PHASE1_CONFIG,
+        )  # must be registered before add_view
+
+    @action_method
+    def add_request_argument_provider(self, name, provider, requires=()):
+        """
+        .. versionadded:: 2.1
+
+        Register a named, request-scoped argument for use by
+        :term:`view derivers <view deriver>`.
+
+        A view deriver may declare a ``request_arguments`` attribute naming
+        one or more arguments it needs.  Instead of reading those values
+        from settings at configuration time, the registered ``provider``
+        is invoked at most once per request (just before the derived view
+        runs) and the resolved value is passed to the deriver's wrapper as
+        a keyword argument.  When several derivers need the same argument,
+        the provider is invoked only once for the request and the cached
+        value is shared between them.
+
+        ``name`` is the argument name.  It must be a valid Python
+        identifier because it is passed as a keyword argument to the
+        deriver wrapper.
+
+        ``provider`` should be a callable accepting ``(request)`` or
+        ``(request, **dependencies)``.  If the provider raises, the
+        exception propagates while the view executes and is handled by
+        the normal :term:`exception view` machinery.
+
+        ``requires`` may be a string or a list of strings naming other
+        request arguments that this provider depends on.  The dependency
+        arguments are resolved first (and themselves cached per request)
+        and passed to the provider as keyword arguments.  Dependency
+        names and the absence of cyclic dependencies are checked when the
+        views are derived.
+        """
+        provider = self.maybe_dotted(provider)
+
+        if not isinstance(name, str) or not name.isidentifier():
+            raise ConfigurationError(
+                'request argument provider name %r must be a valid '
+                'Python identifier' % (name,)
+            )
+
+        requires = as_sorted_tuple(requires)
+
+        discriminator = ('request argument provider', name)
+        intr = self.introspectable(
+            'request argument providers',
+            name,
+            name,
+            'request argument provider',
+        )
+        intr['name'] = name
+        intr['provider'] = provider
+        intr['requires'] = requires
+
+        def register():
+            providers = self.registry.queryUtility(
+                IRequestArgumentProviders
+            )
+            if providers is None:
+                providers = {}
+                self.registry.registerUtility(
+                    providers, IRequestArgumentProviders
+                )
+            providers[name] = RequestArgumentProvider(
+                name, provider, requires
+            )
 
         self.action(
             discriminator,

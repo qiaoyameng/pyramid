@@ -9,6 +9,7 @@ from pyramid.interfaces import (
     IDebugLogger,
     IDefaultCSRFOptions,
     IDefaultPermission,
+    IRequestArgumentProviders,
     IResponse,
     ISecurityPolicy,
     IViewMapper,
@@ -529,3 +530,139 @@ csrf_view.options = ('require_csrf',)
 
 VIEW = 'VIEW'
 INGRESS = 'INGRESS'
+
+
+class RequestArgumentProvider:
+    """A named, request-scoped value used by view derivers.
+
+    ``provider`` is a callable accepting ``(request, **dependencies)``.
+    ``requires`` is the tuple of other request argument names whose
+    resolved values are passed to the provider as keyword arguments.
+    """
+
+    def __init__(self, name, provider, requires=()):
+        self.name = name
+        self.provider = provider
+        self.requires = tuple(requires)
+
+
+_REQUEST_ARG_CACHE = '__request_argument_cache__'
+_RESOLUTION_FAILED = object()
+
+
+def validate_request_arguments(providers, names):
+    """Validate request argument requirements at configuration time.
+
+    Ensures every requested name has a registered provider and that the
+    provider dependency graph references only known names without cycles.
+    """
+    if not providers:
+        providers = {}
+
+    for name in names:
+        if name not in providers:
+            raise ConfigurationError(
+                'No request argument provider registered for %r' % (name,)
+            )
+
+    state = {}
+
+    def visit(name, chain):
+        status = state.get(name)
+        if status == 'done':
+            return
+        if status == 'visiting':
+            cycle = chain[chain.index(name) :] + [name]
+            raise ConfigurationError(
+                'Cyclic dependency detected between request argument '
+                'providers: %s' % (' -> '.join(repr(n) for n in cycle),)
+            )
+        state[name] = 'visiting'
+        for dep in providers[name].requires:
+            if dep not in providers:
+                raise ConfigurationError(
+                    'Request argument provider %r depends on an '
+                    'unregistered argument %r' % (name, dep)
+                )
+            visit(dep, chain + [name])
+        state[name] = 'done'
+
+    for name in names:
+        visit(name, [])
+
+
+def resolve_request_argument(request, registry, name):
+    """Resolve a request argument, computing its provider at most once.
+
+    The resolved values are cached on the request for the lifetime of
+    that request only, so several deriver layers may share the same
+    value without invoking a provider with side effects repeatedly.
+    Providers are resolved lazily; a predicate mismatch on the view
+    prevents any provider from running, and a provider raising an
+    exception propagates through the normal exception view machinery.
+    """
+    cache = request.__dict__.get(_REQUEST_ARG_CACHE)
+    if cache is None:
+        cache = request.__dict__[_REQUEST_ARG_CACHE] = {}
+
+    try:
+        cached = cache[name]
+    except KeyError:
+        pass
+    else:
+        if (
+            isinstance(cached, tuple)
+            and len(cached) == 2
+            and cached[0] is _RESOLUTION_FAILED
+        ):
+            raise cached[1]
+        return cached
+
+    providers = registry.getUtility(IRequestArgumentProviders)
+    record = providers[name]
+    try:
+        dependencies = {
+            dep: resolve_request_argument(request, registry, dep)
+            for dep in record.requires
+        }
+        value = record.provider(request, **dependencies)
+    except BaseException as exc:
+        # remember the failure so other deriver layers sharing this
+        # argument do not re-invoke a provider with side effects
+        cache[name] = (_RESOLUTION_FAILED, exc)
+        raise
+    cache[name] = value
+    return value
+
+
+def request_arguments(deriver):
+    return tuple(getattr(deriver, 'request_arguments', ()) or ())
+
+
+def inject_request_arguments(deriver, names):
+    """Adapt a deriver so its wrapper receives resolved request arguments.
+
+    The deriver is called at configuration time as usual.  The wrapper it
+    returns is invoked with the requested arguments as extra keyword
+    arguments when the view is executed.
+    """
+    arg_names = tuple(names)
+
+    def injecting_deriver(view, info):
+        wrapped_view = deriver(view, info)
+        if wrapped_view is view:
+            return view
+
+        def view_with_request_arguments(context, request):
+            kwargs = {
+                name: resolve_request_argument(
+                    request, info.registry, name
+                )
+                for name in arg_names
+            }
+            return wrapped_view(context, request, **kwargs)
+
+        return view_with_request_arguments
+
+    injecting_deriver.request_arguments = arg_names
+    return injecting_deriver

@@ -1789,6 +1789,66 @@ You can check for ``info.exception_only`` on the
 :class:`pyramid.interfaces.IViewDeriverInfo` object when wrapping the view
 to determine whether you are wrapping an exception view or a normal view.
 
+.. _view_deriver_request_arguments:
+
+Request Arguments for View Derivers
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: 2.1
+
+Some view derivers need values that can only be computed from the current
+request, such as a tenant, a region, or an authenticated principal. Reading
+settings at configuration time is not enough for those cases. A deriver may
+declare the request-computed values it needs by setting a
+``request_arguments`` attribute, and register a matching provider with
+:meth:`pyramid.config.Configurator.add_request_argument_provider`:
+
+.. code-block:: python
+    :linenos:
+
+    def region_provider(request):
+        return request.headers.get('X-Region', 'unknown')
+
+    def region_tagged_view(view, info):
+        def wrapper(context, request, region):
+            response = view(context, request)
+            response.headers['X-Region'] = region
+            return response
+        return wrapper
+
+    region_tagged_view.request_arguments = ('region',)
+
+    config.add_request_argument_provider('region', region_provider)
+    config.add_view_deriver(region_tagged_view)
+
+The argument names and the dependency graph between providers are validated
+when views are derived at configuration time. At runtime each provider is
+invoked at most once per request, just before the derived view executes, and
+the resolved value is passed to the deriver's wrapper as a keyword argument.
+When several derivers declare the same argument, they share the cached value,
+so a provider with side effects is never invoked repeatedly because of
+wrapping order. The cache lives on the request and is discarded when the
+request ends.
+
+Providers are resolved lazily: if a view's predicates do not match, no
+provider runs for that view. If a provider raises an exception, it propagates
+while the view executes and is handled by the normal :term:`exception view`
+machinery.
+
+A provider may depend on other request arguments by passing ``requires`` to
+:meth:`pyramid.config.Configurator.add_request_argument_provider`. The
+dependencies are resolved first and passed to the provider as keyword
+arguments:
+
+.. code-block:: python
+    :linenos:
+
+    def region_label_provider(request, region):
+        return 'region:%s' % region
+
+    config.add_request_argument_provider(
+        'region_label', region_label_provider, requires='region')
+
 Ordering View Derivers
 ~~~~~~~~~~~~~~~~~~~~~~
 
