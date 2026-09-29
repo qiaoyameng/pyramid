@@ -16,6 +16,7 @@
     .. automethod:: begin
     .. automethod:: end
     .. automethod:: include
+    .. automethod:: tentative_include
     .. automethod:: make_wsgi_app()
     .. automethod:: route_prefix_context
     .. automethod:: scan

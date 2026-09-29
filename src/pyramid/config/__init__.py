@@ -10,6 +10,7 @@ from pyramid.authorization import ACLAuthorizationPolicy
 from pyramid.config.actions import (
     ActionConfiguratorMixin,
     ActionState,
+    TentativeInclude,
     action_method,
 )
 from pyramid.config.adapters import AdaptersConfiguratorMixin
@@ -672,6 +673,72 @@ class Configurator(
                     c(configurator)
                 finally:
                     self.end()
+
+    def tentative_include(self, callable, route_prefix=None):
+        """Include a configuration callable tentatively, returning a
+        context manager which allows the configuration performed by the
+        callable to be rolled back before it is committed.
+
+        This is useful when probing a set of candidate plugins: each
+        candidate can be included, and if it turns out not to be suitable,
+        every configuration action it queued can be discarded atomically,
+        as if it had never been included.
+
+        Usage::
+
+            with config.tentative_include('myplugin') as tentative:
+                if not plugin_is_suitable(config):
+                    tentative.rollback()
+
+        The ``callable`` and ``route_prefix`` arguments are treated
+        exactly as they are by :meth:`include`, and the callable is
+        invoked when the ``with`` block is entered.  Any configuration
+        actions (and their associated :term:`introspectable` objects)
+        queued by the callable -- including those queued by configuration
+        callables it includes in turn, and by nested tentative include
+        blocks -- belong to the block.
+
+        When the ``with`` block exits:
+
+        - If :meth:`pyramid.config.actions.TentativeInclude.rollback` was
+          called, or the block body raised an exception, all of the
+          block's pending actions are discarded.  Because none of the
+          block's actions have been executed yet (see below), rollback
+          never runs a registration callable and then tries to undo it;
+          the actions are simply removed from the pending list, along
+          with the record that the callable was included (so it may be
+          included again later).  Discriminators queued by a rolled-back
+          block no longer participate in conflict detection, so another
+          callable may subsequently register, for example, a route with
+          the same name without causing a
+          :exc:`pyramid.exceptions.ConfigurationConflictError`.
+
+        - Otherwise the block's actions are kept and participate in
+          conflict resolution and execution exactly as if
+          :meth:`include` had been used.
+
+        A tentative include block is only valid while its actions are
+        still pending:
+
+        - It may not be used at all when the configurator's
+          ``autocommit`` flag is ``True``, because actions would be
+          executed immediately and could not be rolled back.
+
+        - Once :meth:`commit` has processed the block's actions (for
+          example when ``commit`` is called inside the block, or when the
+          configurator itself is used as a context manager), rolling the
+          block back is no longer possible and :meth:`rollback
+          <pyramid.config.actions.TentativeInclude.rollback>` raises
+          :exc:`pyramid.exceptions.ConfigurationError`.
+
+        Only state tracked through the configurator's action list is
+        rolled back; side effects that the included callable performs
+        directly on the registry (or elsewhere) are outside the scope of
+        this mechanism.
+
+        .. versionadded:: 2.2
+        """
+        return TentativeInclude(self, callable, route_prefix)
 
     def add_directive(self, name, directive, action_wrap=True):
         """

@@ -987,6 +987,237 @@ test_config.dummy_include2"""
         config.include(include)
         self.assertTrue(stack[0] is config.registry)
 
+    def test_tentative_include_keep_commits_normally(self):
+        from pyramid.interfaces import IRoutesMapper
+
+        def plugin(config):
+            config.add_route('home', '/a')
+
+        config = self._makeOne()
+        with config.tentative_include(plugin):
+            pass
+        config.commit()
+        mapper = config.registry.getUtility(IRoutesMapper)
+        self.assertEqual(mapper.get_route('home').pattern, '/a')
+        introspected = config.introspector.get_category('routes')
+        self.assertEqual(len(introspected), 1)
+        self.assertEqual(
+            introspected[0]['introspectable']['name'], 'home'
+        )
+
+    def test_tentative_include_explicit_keep(self):
+        config = self._makeOne()
+        with config.tentative_include(dummy_include) as tentative:
+            tentative.rollback()
+            tentative.keep()
+        self.assertEqual(len(config.action_state.actions), 1)
+        self.assertEqual(
+            config.action_state.actions[0]['discriminator'], 'discrim'
+        )
+
+    def test_tentative_include_rollback_discards_pending_actions(self):
+        executed = []
+
+        def plugin(config):
+            config.action('discrim', lambda: executed.append(True))
+
+        config = self._makeOne()
+        with config.tentative_include(plugin) as tentative:
+            tentative.rollback()
+        self.assertEqual(config.action_state.actions, [])
+        config.commit()
+        # the registration callable was never executed, so there is
+        # nothing to "undo"
+        self.assertEqual(executed, [])
+
+    def test_tentative_include_rollback_removes_introspectables(self):
+        def plugin(config):
+            config.add_route('home', '/a')
+
+        config = self._makeOne()
+        with config.tentative_include(plugin) as tentative:
+            tentative.rollback()
+        config.commit()
+        self.assertEqual(config.introspector.get_category('routes', []), [])
+
+    def test_tentative_include_rollback_frees_route_name(self):
+        from pyramid.interfaces import IRoutesMapper
+
+        def plugin_a(config):
+            config.add_route('home', '/a')
+
+        def plugin_b(config):
+            config.add_route('home', '/b')
+
+        config = self._makeOne()
+        with config.tentative_include(plugin_a) as tentative:
+            tentative.rollback()
+        # another plugin may now use the same route name without a
+        # ConfigurationConflictError at commit time
+        config.include(plugin_b)
+        config.commit()
+        mapper = config.registry.getUtility(IRoutesMapper)
+        self.assertEqual(mapper.get_route('home').pattern, '/b')
+        introspected = config.introspector.get_category('routes')
+        self.assertEqual(len(introspected), 1)
+        self.assertEqual(
+            introspected[0]['introspectable']['pattern'], '/b'
+        )
+
+    def test_tentative_include_keep_conflicts_normally(self):
+        from pyramid.exceptions import ConfigurationConflictError
+
+        def plugin_a(config):
+            config.add_route('home', '/a')
+
+        def plugin_b(config):
+            config.add_route('home', '/b')
+
+        config = self._makeOne()
+        with config.tentative_include(plugin_a):
+            pass
+        config.include(plugin_b)
+        self.assertRaises(ConfigurationConflictError, config.commit)
+
+    def test_tentative_include_rollback_allows_reinclude(self):
+        from pyramid.interfaces import IRoutesMapper
+
+        def plugin(config):
+            config.add_route('home', '/a')
+
+        config = self._makeOne()
+        with config.tentative_include(plugin) as tentative:
+            tentative.rollback()
+        # the include spec was forgotten, so the same callable may be
+        # included again instead of being skipped as already-seen
+        config.include(plugin)
+        config.commit()
+        mapper = config.registry.getUtility(IRoutesMapper)
+        self.assertEqual(mapper.get_route('home').pattern, '/a')
+
+    def test_tentative_include_nested_blocks_rollback_together(self):
+        executed = []
+
+        def inner_plugin(config):
+            config.action('inner', lambda: executed.append('inner'))
+
+        def outer_plugin(config):
+            config.action('outer', lambda: executed.append('outer'))
+            with config.tentative_include(inner_plugin):
+                pass  # inner block is kept...
+
+        config = self._makeOne()
+        with config.tentative_include(outer_plugin) as tentative:
+            tentative.rollback()  # ...but the outer rollback wins
+        config.commit()
+        self.assertEqual(executed, [])
+
+    def test_tentative_include_nested_blocks_inner_rollback_only(self):
+        executed = []
+
+        def inner_plugin(config):
+            config.action('inner', lambda: executed.append('inner'))
+
+        def outer_plugin(config):
+            config.action('outer', lambda: executed.append('outer'))
+            with config.tentative_include(inner_plugin) as tentative:
+                tentative.rollback()
+
+        config = self._makeOne()
+        with config.tentative_include(outer_plugin):
+            pass
+        config.commit()
+        self.assertEqual(executed, ['outer'])
+
+    def test_tentative_include_exception_discards_block(self):
+        config = self._makeOne()
+
+        def plugin(config):
+            config.action('discrim', None)
+
+        try:
+            with config.tentative_include(plugin):
+                raise RuntimeError('plugin probing failed')
+        except RuntimeError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError
+        self.assertEqual(config.action_state.actions, [])
+
+    def test_tentative_include_failed_include_discards_partial_actions(
+        self,
+    ):
+        config = self._makeOne()
+
+        def plugin(config):
+            config.action('discrim', None)
+            raise RuntimeError('boom')
+
+        try:
+            with config.tentative_include(plugin):
+                pass  # pragma: no cover
+        except RuntimeError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError
+        self.assertEqual(config.action_state.actions, [])
+
+    def test_tentative_include_rollback_after_commit_forbidden(self):
+        from pyramid.exceptions import ConfigurationError
+
+        def plugin(config):
+            config.add_route('home', '/a')
+
+        config = self._makeOne()
+        with config.tentative_include(plugin) as tentative:
+            config.commit()
+            self.assertRaisesRegex(
+                ConfigurationError, 'committed', tentative.rollback
+            )
+
+    def test_tentative_include_rollback_after_block_closed_forbidden(self):
+        from pyramid.exceptions import ConfigurationError
+
+        config = self._makeOne()
+        with config.tentative_include(dummy_include) as tentative:
+            pass
+        config.commit()
+        self.assertRaises(ConfigurationError, tentative.rollback)
+
+    def test_tentative_include_autocommit_forbidden(self):
+        from pyramid.exceptions import ConfigurationError
+
+        config = self._makeOne(autocommit=True)
+        self.assertRaises(
+            ConfigurationError,
+            config.tentative_include(dummy_include).__enter__,
+        )
+
+    def test_tentative_include_with_route_prefix(self):
+        from pyramid.interfaces import IRoutesMapper
+
+        def plugin(config):
+            config.add_route('home', '/a')
+
+        config = self._makeOne()
+        with config.tentative_include(plugin, route_prefix='prefix'):
+            pass
+        config.commit()
+        mapper = config.registry.getUtility(IRoutesMapper)
+        self.assertEqual(mapper.get_route('home').pattern, 'prefix/a')
+
+    def test_tentative_include_normal_include_unaffected(self):
+        # actions queued before and after a rolled-back block are kept
+        config = self._makeOne()
+        config.action('before', None)
+        with config.tentative_include(dummy_include) as tentative:
+            tentative.rollback()
+        config.action('after', None)
+        self.assertEqual(
+            [a['discriminator'] for a in config.action_state.actions],
+            ['before', 'after'],
+        )
+
     def test_scan_integration(self):
         from zope.interface import alsoProvides
 

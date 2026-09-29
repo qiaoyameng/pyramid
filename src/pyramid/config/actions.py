@@ -154,6 +154,115 @@ class ActionConfiguratorMixin:
         self.action_state = ActionState()  # old actions have been processed
 
 
+class TentativeInclude:
+    """A context manager which includes a configuration callable and
+    allows the resulting pending configuration actions to be either kept
+    or rolled back when the block exits.
+
+    See :meth:`pyramid.config.Configurator.tentative_include`.
+
+    Rollback is purely subtractive: the actions (and their associated
+    :term:`introspectable` objects) produced by the included callable --
+    including any configuration callables it includes in turn -- are
+    removed from the pending action list *before* any of them has been
+    executed.  No registration callable is ever run and then "undone".
+    Because of this, a tentative include block is only usable while its
+    actions are still pending, i.e. before
+    :meth:`pyramid.config.Configurator.commit` has processed them, and it
+    cannot be used at all when the configurator's ``autocommit`` flag is
+    ``True``.
+    """
+
+    def __init__(self, configurator, callable, route_prefix=None):
+        self.configurator = configurator
+        self.callable = callable
+        self.route_prefix = route_prefix
+        self._action_state = None
+        self._marker = None
+        self._seen_files = None
+        self._closed = False
+        self._rollback_requested = False
+
+    def __enter__(self):
+        configurator = self.configurator
+        if configurator.autocommit:
+            raise ConfigurationError(
+                'tentative_include cannot be used when autocommit is True; '
+                'actions would be executed immediately and could not be '
+                'rolled back'
+            )
+        action_state = configurator.action_state
+        self._action_state = action_state
+        self._marker = len(action_state.actions)
+        self._seen_files = set(action_state._seen_files)
+        try:
+            configurator.include(
+                self.callable, route_prefix=self.route_prefix
+            )
+        except Exception:
+            # a failed include leaves the block half-populated; discard
+            # whatever it added so no partial configuration is kept
+            self._discard()
+            self._closed = True
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        if self._closed:
+            return False
+        self._closed = True
+        if self._rollback_requested or exc_type is not None:
+            # an exception escaping the block also discards the block's
+            # actions: keeping half-configured state is never useful
+            self._check_pending()
+            self._discard()
+        return False
+
+    def keep(self):
+        """Explicitly keep the actions produced by this block.  This is
+        the default when the block exits without an exception and without
+        :meth:`rollback` having been called; calling it cancels a previous
+        :meth:`rollback` request made within the same block."""
+        if self._closed:
+            raise ConfigurationError(
+                'This tentative include block has already been closed.'
+            )
+        self._rollback_requested = False
+
+    def rollback(self):
+        """Request that the actions produced by this block be discarded
+        when the block exits.  Raises :exc:`ConfigurationError` if the
+        block's actions are no longer pending, most notably when they have
+        already been committed via
+        :meth:`pyramid.config.Configurator.commit`."""
+        if self._closed:
+            raise ConfigurationError(
+                'This tentative include block has already been closed.'
+            )
+        self._check_pending()
+        self._rollback_requested = True
+
+    def _check_pending(self):
+        if self.configurator.action_state is not self._action_state:
+            raise ConfigurationError(
+                'Cannot roll back a tentative include: its actions have '
+                'already been committed.'
+            )
+        if len(self._action_state.actions) < self._marker:
+            raise ConfigurationError(
+                'Cannot roll back a tentative include: its actions are no '
+                'longer pending.'
+            )
+
+    def _discard(self):
+        action_state = self._action_state
+        # drop every action added since the block was entered, including
+        # actions added by nested includes and nested tentative blocks
+        del action_state.actions[self._marker :]
+        # allow the included callable(s) to be included again later
+        action_state._seen_files = self._seen_files
+
+
 # this class is licensed under the ZPL (stolen from Zope)
 class ActionState:
     def __init__(self):
