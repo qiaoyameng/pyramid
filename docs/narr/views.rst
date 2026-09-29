@@ -358,6 +358,61 @@ styles.
    ``pyramid.tweens`` configuration setting list explicitly.  If it is not
    present, Pyramid will not perform exception view handling.
 
+.. _exception_group_views:
+
+Exception Group Views
+---------------------
+
+.. versionadded:: 2.2
+
+When several operations run in parallel (for example with
+:mod:`asyncio` tasks), failures are often raised as an
+:exc:`ExceptionGroup`.  By default :app:`Pyramid` treats an exception
+group like any other single exception.  Applications may instead opt
+into the *exception group view protocol* by registering an
+:term:`exception group view` with
+:meth:`pyramid.config.Configurator.add_exception_group_view` or the
+:class:`pyramid.view.exception_group_view_config` decorator.
+
+When the protocol is active for a raised exception group, :app:`Pyramid`
+walks the leaves of the (possibly nested) group and invokes the
+:term:`exception view` registered for each leaf's type, honoring any
+view predicates.  Each leaf is processed at most once.  The per-leaf
+results are exposed to the exception group view as
+``request.exception_group_results``, a list of
+:class:`pyramid.view.ExceptionGroupLeafResult` objects; each result
+carries the leaf exception, its ``path`` (a tuple of child indices
+locating the leaf within the nested group), and the response produced
+for it.  The exception group view then decides the final response for
+the whole group:
+
+.. code-block:: python
+    :linenos:
+
+    from pyramid.response import Response
+    from pyramid.view import exception_group_view_config
+
+    @exception_group_view_config(ExceptionGroup)
+    def aggregate(group, request):
+        results = request.exception_group_results
+        status = max(r.response.status_int for r in results)
+        return Response(
+            status=status,
+            json_body={'errors': [str(r.leaf) for r in results]},
+        )
+
+If any leaf exception cannot be handled by a registered exception view,
+the exception group view is *not* invoked.  Instead, a new exception
+group containing only the unhandled leaves is raised so that outer
+layers (such as tweens or the WSGI server) can deal with them.  The
+original exception chain (``__cause__``, ``__context__``, and
+tracebacks) is preserved on this remainder group.  A
+:exc:`BaseExceptionGroup` that is not an :exc:`ExceptionGroup` — one
+containing cancellations such as :exc:`asyncio.CancelledError` or
+:exc:`KeyboardInterrupt` — is never split into leaves and never
+converted into a response; it always propagates to outer layers
+unchanged.
+
 .. index::
    single: view http redirect
    single: http redirect (from a view)

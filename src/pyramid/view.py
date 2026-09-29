@@ -4,6 +4,16 @@ import sys
 import venusian
 from zope.interface import providedBy
 
+try:
+    from builtins import BaseExceptionGroup
+
+    _EXCEPTION_GROUP_TYPES = (BaseExceptionGroup,)
+except ImportError:  # pragma: no cover -- Python < 3.11
+    # PEP 654 exception groups do not exist on Python < 3.11, so the
+    # exception group view protocol stays dormant there: exception groups
+    # can neither be raised nor caught in the first place.
+    _EXCEPTION_GROUP_TYPES = ()
+
 from pyramid.exceptions import ConfigurationError, PredicateMismatch
 from pyramid.httpexceptions import (
     HTTPNotFound,
@@ -23,6 +33,51 @@ from pyramid.threadlocal import get_current_registry, manager
 from pyramid.util import hide_attrs, reraise as reraise_
 
 _marker = object()
+
+#: The view name under which exception group views (aggregate views for
+#: exception groups) are registered.  See
+#: :meth:`pyramid.config.Configurator.add_exception_group_view`.
+EXCEPTION_GROUP_VIEW_NAME = 'exception_group'
+
+
+class ExceptionGroupLeafResult:
+    """The result of invoking an :term:`exception view` for a single leaf
+    exception of an :exc:`ExceptionGroup`.
+
+    .. versionadded:: 2.2
+
+    When the exception group view protocol is active (see
+    :meth:`pyramid.config.Configurator.add_exception_group_view`), a list of
+    these objects is made available to the exception group view as
+    ``request.exception_group_results``.  Each instance has the following
+    attributes:
+
+    ``leaf``
+
+        The leaf exception instance that was handled.
+
+    ``path``
+
+        A tuple of integer indices describing the position of the leaf
+        within the (possibly nested) exception group.  For example, a path
+        of ``(0, 2)`` means the leaf is
+        ``group.exceptions[0].exceptions[2]``.
+
+    ``response``
+
+        The :term:`response` object returned by the exception view that
+        handled the leaf.
+    """
+
+    def __init__(self, leaf, path, response):
+        self.leaf = leaf
+        self.path = path
+        self.response = response
+
+    def __repr__(self):
+        return '<{} path={!r} leaf={!r} response={!r}>'.format(
+            type(self).__name__, self.path, self.leaf, self.response
+        )
 
 
 def render_view_to_response(context, request, name='', secure=True):
@@ -593,6 +648,77 @@ class exception_view_config:
         return wrapped
 
 
+class exception_group_view_config:
+    """
+    .. versionadded:: 2.2
+
+    An analogue of :class:`pyramid.view.view_config` which registers an
+    :term:`exception group view` using
+    :meth:`pyramid.config.Configurator.add_exception_group_view`.
+
+    The ``exception_group_view_config`` constructor accepts an exception
+    group context (a subclass of :exc:`ExceptionGroup`), and additionally
+    accepts most of the same arguments as the constructor of
+    :class:`pyramid.view.view_config`.  It can be used in the same places,
+    and behaves in largely the same way, except it registers an aggregate
+    view which is invoked with the exception group itself once every leaf
+    of the group has been handled by an :term:`exception view`.
+
+    Example:
+
+    .. code-block:: python
+
+        from pyramid.response import Response
+        from pyramid.view import exception_group_view_config
+
+        @exception_group_view_config(ExceptionGroup)
+        def aggregate(group, request):
+            results = request.exception_group_results
+            status = max(r.response.status_int for r in results)
+            return Response(status=status, json_body={
+                'errors': [str(r.leaf) for r in results],
+            })
+
+    All arguments passed to this function have the same meaning as
+    :meth:`pyramid.view.view_config`, and each predicate argument restricts
+    the set of circumstances under which this exception group view will be
+    invoked.
+    """
+
+    venusian = venusian
+
+    def __init__(self, *args, **settings):
+        if 'context' not in settings and len(args) > 0:
+            exception, args = args[0], args[1:]
+            settings['context'] = exception
+        if len(args) > 0:
+            raise ConfigurationError('unknown positional arguments')
+        self.__dict__.update(settings)
+
+    def __call__(self, wrapped):
+        settings = self.__dict__.copy()
+        depth = settings.pop('_depth', 0)
+        category = settings.pop('_category', 'pyramid')
+
+        def callback(context, name, ob):
+            config = context.config.with_package(info.module)
+            config.add_exception_group_view(view=ob, **settings)
+
+        info = self.venusian.attach(
+            wrapped, callback, category=category, depth=depth + 1
+        )
+
+        if info.scope == 'class':
+            # if the decorator was attached to a method in a class, or
+            # otherwise executed at class scope, we need to set an
+            # 'attr' in the settings if one isn't already in there
+            if settings.get('attr') is None:
+                settings['attr'] = wrapped.__name__
+
+        settings['_info'] = info.codeinfo  # fbo "action_method"
+        return wrapped
+
+
 def _find_views(
     registry,
     request_iface,
@@ -682,6 +808,136 @@ def _call_view(
     return response
 
 
+def _walk_exception_group(group, path=()):
+    # yield (path, leaf) pairs for every leaf exception contained in the
+    # group, where path is the tuple of child indices leading from the
+    # root group to the leaf
+    for index, exc in enumerate(group.exceptions):
+        exc_path = path + (index,)
+        if isinstance(exc, _EXCEPTION_GROUP_TYPES):
+            yield from _walk_exception_group(exc, exc_path)
+        else:
+            yield exc_path, exc
+
+
+def _invoke_leaf_exception_view(
+    request, registry, leaf, request_iface, secure
+):
+    # invoke the exception view registered for a single leaf exception,
+    # returning None if no view matches the leaf
+    attrs = request.__dict__
+    leaf_exc_info = (type(leaf), leaf, leaf.__traceback__)
+    with hide_attrs(request, 'response', 'exc_info', 'exception'):
+        attrs['exception'] = leaf
+        attrs['exc_info'] = leaf_exc_info
+        manager.push({'request': request, 'registry': registry})
+        try:
+            response = _call_view(
+                registry,
+                request,
+                leaf,
+                providedBy(leaf),
+                '',
+                view_types=None,
+                view_classifier=IExceptionViewClassifier,
+                secure=secure,
+                request_iface=request_iface.combined,
+            )
+        except PredicateMismatch:
+            response = None
+        finally:
+            manager.pop()
+    return response
+
+
+def _invoke_exception_group_view(request, registry, exc_info, secure=True):
+    # Implements the exception group view protocol for an exc_info whose
+    # exception is a BaseExceptionGroup.  Returns a response if the
+    # protocol produced one, or None if the protocol is not enabled for
+    # this group type (or no leaf could be handled), in which case the
+    # caller falls back to treating the group as a regular exception.
+    exc = exc_info[1]
+    attrs = request.__dict__
+    request_iface = attrs.get('request_iface', IRequest)
+    context_iface = providedBy(exc)
+    aggregate_views = _find_views(
+        registry,
+        request_iface.combined,
+        context_iface,
+        EXCEPTION_GROUP_VIEW_NAME,
+        view_classifier=IExceptionViewClassifier,
+    )
+    if not aggregate_views:
+        # no exception group view is registered for this group type; the
+        # protocol is opt-in, so treat the group as a regular exception
+        return None
+
+    results = []
+    unmatched = []
+    for path, leaf in _walk_exception_group(exc):
+        response = _invoke_leaf_exception_view(
+            request, registry, leaf, request_iface, secure
+        )
+        if response is None:
+            unmatched.append(leaf)
+        else:
+            results.append(
+                ExceptionGroupLeafResult(
+                    leaf=leaf, path=path, response=response
+                )
+            )
+
+    if unmatched and results:
+        # some leaves could not be handled; re-raise a group containing
+        # only the unmatched leaves so outer layers can deal with them.
+        # subgroup() preserves the nesting structure as well as the
+        # __cause__, __context__ and __traceback__ of the original group,
+        # keeping the original exception chain traceable.
+        unmatched_ids = {id(leaf) for leaf in unmatched}
+        remainder = exc.subgroup(lambda leaf: id(leaf) in unmatched_ids)
+        raise remainder
+
+    if unmatched:
+        # no leaf was handled at all; treat the group as a regular
+        # exception
+        return None
+
+    # every leaf was handled exactly once; let the exception group view
+    # decide the final response instead of arbitrarily picking one of the
+    # leaf responses
+    with hide_attrs(
+        request,
+        'response',
+        'exc_info',
+        'exception',
+        'exception_group_results',
+    ):
+        attrs['exception'] = exc
+        attrs['exc_info'] = exc_info
+        attrs['exception_group_results'] = results
+        manager.push({'request': request, 'registry': registry})
+        try:
+            response = _call_view(
+                registry,
+                request,
+                exc,
+                context_iface,
+                EXCEPTION_GROUP_VIEW_NAME,
+                view_types=None,
+                view_classifier=IExceptionViewClassifier,
+                secure=secure,
+                request_iface=request_iface.combined,
+            )
+        finally:
+            manager.pop()
+
+    if response is not None:
+        # successful response, expose the leaf results like
+        # exception/exc_info are exposed by invoke_exception_view
+        attrs['exception_group_results'] = results
+    return response
+
+
 class ViewMethodsMixin:
     """Request methods mixin for BaseRequest having to do with executing
     views"""
@@ -723,6 +979,13 @@ class ViewMethodsMixin:
         response. Otherwise the previous values for ``request.exception`` and
         ``request.exc_info`` will be restored.
 
+        If the exception is an :exc:`ExceptionGroup` and at least one
+        :term:`exception group view` is registered for the group's type,
+        the exception group view protocol is used: each leaf exception of
+        the group is handled by its own exception view and an aggregate
+        view decides the final response.  See
+        :meth:`pyramid.config.Configurator.add_exception_group_view`.
+
         .. versionadded:: 1.7
 
         .. versionchanged:: 1.9
@@ -731,6 +994,10 @@ class ViewMethodsMixin:
            they were reset to the values prior to invoking the method.
 
            Also added the ``reraise`` argument.
+
+        .. versionchanged:: 2.2
+           Added support for the exception group view protocol when the
+           exception is an :exc:`ExceptionGroup`.
 
         """
         if request is None:
@@ -748,6 +1015,27 @@ class ViewMethodsMixin:
         exc = exc_info[1]
         attrs = request.__dict__
         context_iface = providedBy(exc)
+
+        if isinstance(exc, _EXCEPTION_GROUP_TYPES):
+            try:
+                response = _invoke_exception_group_view(
+                    request, registry, exc_info, secure=secure
+                )
+            except _EXCEPTION_GROUP_TYPES:
+                # a remainder group of unhandled leaves; it must
+                # propagate untouched so outer layers can deal with it
+                raise
+            except Exception:
+                if reraise:
+                    reraise_(*exc_info)
+                raise
+            if response is not None:
+                # successful response, overwrite exception/exc_info
+                attrs['exception'] = exc
+                attrs['exc_info'] = exc_info
+                return response
+            # no exception group view could handle the group; fall through
+            # and treat the group as a regular exception
 
         # clear old generated request.response, if any; it may
         # have been mutated by the view, and its state is not

@@ -1,5 +1,6 @@
 from datetime import timezone
 import os
+import sys
 import unittest
 import warnings
 from zope.interface import implementer
@@ -14,6 +15,9 @@ from pyramid.interfaces import IMultiView, IRequest, IResponse
 from pyramid.util import text_
 
 from . import IDummy, dummy_view
+
+
+py311plus = sys.version_info[:2] >= (3, 11)
 
 
 class TestViewsConfigurationMixin(unittest.TestCase):
@@ -2496,6 +2500,124 @@ class TestViewsConfigurationMixin(unittest.TestCase):
         context = DummyContext()
         request = self._makeRequest(config)
         self.assertRaises(PredicateMismatch, wrapper, context, request)
+
+    @unittest.skipUnless(py311plus, 'exception groups require Python 3.11+')
+    def test_add_exception_group_view(self):
+        from zope.interface import implementedBy
+
+        from pyramid.renderers import null_renderer
+        from pyramid.view import EXCEPTION_GROUP_VIEW_NAME
+
+        view1 = lambda *arg: 'OK'
+        config = self._makeOne(autocommit=True)
+        config.add_exception_group_view(view=view1, renderer=null_renderer)
+        wrapper = self._getViewCallable(
+            config,
+            exc_iface=implementedBy(ExceptionGroup),
+            name=EXCEPTION_GROUP_VIEW_NAME,
+        )
+        context = ExceptionGroup('g', [ValueError('v')])
+        request = self._makeRequest(config)
+        self.assertEqual(wrapper(context, request), 'OK')
+
+    @unittest.skipUnless(py311plus, 'exception groups require Python 3.11+')
+    def test_add_exception_group_view_with_subclass(self):
+        from zope.interface import implementedBy
+
+        from pyramid.renderers import null_renderer
+        from pyramid.view import EXCEPTION_GROUP_VIEW_NAME
+
+        class MyGroup(ExceptionGroup):
+            pass
+
+        view1 = lambda *arg: 'OK'
+        config = self._makeOne(autocommit=True)
+        config.add_exception_group_view(
+            view=view1, context=MyGroup, renderer=null_renderer
+        )
+        wrapper = self._getViewCallable(
+            config,
+            exc_iface=implementedBy(MyGroup),
+            name=EXCEPTION_GROUP_VIEW_NAME,
+        )
+        context = MyGroup('g', [ValueError('v')])
+        request = self._makeRequest(config)
+        self.assertEqual(wrapper(context, request), 'OK')
+
+    @unittest.skipUnless(py311plus, 'exception groups require Python 3.11+')
+    def test_add_exception_group_view_not_a_normal_exception_view(self):
+        # the aggregate view is registered under its own view name and
+        # does not shadow normal exception views for the same group type
+        from zope.interface import implementedBy
+
+        from pyramid.renderers import null_renderer
+
+        view1 = lambda *arg: 'OK'
+        config = self._makeOne(autocommit=True)
+        config.add_exception_group_view(view=view1, renderer=null_renderer)
+        wrapper = self._getViewCallable(
+            config, exc_iface=implementedBy(ExceptionGroup)
+        )
+        self.assertEqual(wrapper, None)
+
+    def test_add_exception_group_view_disallows_name(self):
+        config = self._makeOne(autocommit=True)
+        self.assertRaises(
+            ConfigurationError,
+            config.add_exception_group_view,
+            context=Exception,
+            name='foo',
+        )
+
+    def test_add_exception_group_view_disallows_permission(self):
+        config = self._makeOne(autocommit=True)
+        self.assertRaises(
+            ConfigurationError,
+            config.add_exception_group_view,
+            context=Exception,
+            permission='foo',
+        )
+
+    def test_add_exception_group_view_disallows_require_csrf(self):
+        config = self._makeOne(autocommit=True)
+        self.assertRaises(
+            ConfigurationError,
+            config.add_exception_group_view,
+            context=Exception,
+            require_csrf=True,
+        )
+
+    def test_add_exception_group_view_disallows_for_(self):
+        config = self._makeOne(autocommit=True)
+        self.assertRaises(
+            ConfigurationError,
+            config.add_exception_group_view,
+            context=Exception,
+            for_='foo',
+        )
+
+    def test_add_exception_group_view_disallows_exception_only(self):
+        config = self._makeOne(autocommit=True)
+        self.assertRaises(
+            ConfigurationError,
+            config.add_exception_group_view,
+            context=Exception,
+            exception_only=True,
+        )
+
+    @unittest.skipUnless(py311plus, 'exception groups require Python 3.11+')
+    def test_add_exception_group_view_requires_group_context(self):
+        config = self._makeOne(autocommit=True)
+        self.assertRaises(
+            ConfigurationError,
+            config.add_exception_group_view,
+            context=ValueError,
+        )
+        self.assertRaises(
+            ConfigurationError,
+            config.add_exception_group_view,
+            context=BaseExceptionGroup,
+        )
 
     def test_derive_view_function(self):
         from pyramid.renderers import null_renderer

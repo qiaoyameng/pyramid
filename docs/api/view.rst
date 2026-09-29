@@ -25,3 +25,8 @@
   .. autoclass:: exception_view_config
      :members:
 
+  .. autoclass:: exception_group_view_config
+     :members:
+
+  .. autoclass:: ExceptionGroupLeafResult
+     :members:

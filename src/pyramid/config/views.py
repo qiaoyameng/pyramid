@@ -55,7 +55,10 @@ from pyramid.util import (
     as_sorted_tuple,
     is_nonstr_iter,
 )
-from pyramid.view import AppendSlashNotFoundViewFactory
+from pyramid.view import (
+    EXCEPTION_GROUP_VIEW_NAME,
+    AppendSlashNotFoundViewFactory,
+)
 import pyramid.viewderivers
 from pyramid.viewderivers import (
     INGRESS,
@@ -66,6 +69,12 @@ from pyramid.viewderivers import (
     view_description,
     wraps_view,
 )
+
+try:
+    from builtins import ExceptionGroup
+except ImportError:  # pragma: no cover -- Python < 3.11
+    # PEP 654 exception groups do not exist on Python < 3.11
+    ExceptionGroup = None
 
 DefaultViewMapper = DefaultViewMapper  # bw-compat
 preserve_view_attrs = preserve_view_attrs  # bw-compat
@@ -1883,6 +1892,108 @@ class ViewsConfiguratorMixin:
             dict(
                 view=view,
                 context=context,
+                exception_only=True,
+                permission=NO_PERMISSION_REQUIRED,
+                require_csrf=False,
+            )
+        )
+        return self.add_view(**view_options)
+
+    @action_method
+    def add_exception_group_view(
+        self,
+        view=None,
+        context=None,
+        # force all other arguments to be specified as key=value
+        **view_options,
+    ):
+        """Add an :term:`exception group view` for the specified exception
+        group type to the current configuration state.
+
+        An exception group view is an *aggregate* view: it is invoked when
+        an :exc:`ExceptionGroup` (or ``context`` subclass thereof) is
+        raised and every leaf exception of the group has been handled by a
+        matching :term:`exception view`.  The exception group view decides
+        the final response for the whole group, for example by inspecting
+        the responses produced for each leaf.
+
+        When the exception group view protocol is active for a raised
+        exception group, Pyramid walks the leaves of the (possibly nested)
+        group and, for each leaf exception, invokes the exception view
+        registered for that leaf's type, honoring any view predicates.
+        Each leaf is processed at most once.  The per-leaf results are
+        made available to the exception group view as
+        ``request.exception_group_results``, a list of
+        :class:`pyramid.view.ExceptionGroupLeafResult` objects; each
+        result carries the leaf exception, its ``path`` (a tuple of child
+        indices locating the leaf within the nested group), and the
+        response produced for it.
+
+        If any leaf exception cannot be handled by a registered exception
+        view, a new exception group containing only the unhandled leaves
+        is raised instead of invoking the exception group view, so the
+        unhandled parts remain visible to outer layers (such as tweens or
+        the WSGI server).  The original exception chain (``__cause__``,
+        ``__context__`` and tracebacks) is preserved on the remainder
+        group.
+
+        A :exc:`BaseExceptionGroup` that is not an :exc:`ExceptionGroup`
+        (in other words, a group containing leaves such as
+        :exc:`asyncio.CancelledError` or :exc:`KeyboardInterrupt` that are
+        not :exc:`Exception` instances) is never split into leaves and
+        never converted into a response; it always propagates to outer
+        layers unchanged, so cancellations cannot be swallowed into an
+        error response.
+
+        This method accepts almost all of the same arguments as
+        :meth:`pyramid.config.Configurator.add_view` except for ``name``,
+        ``permission``, ``for_``, ``require_csrf``, and
+        ``exception_only``.
+
+        By default, this method will set ``context=ExceptionGroup``.  Any
+        subclass of :exc:`ExceptionGroup` may be specified.
+
+        .. note::
+
+           The exception group view protocol requires Python 3.11 or
+           newer.  If no exception group view is registered for a raised
+           exception group, the group is treated as a regular exception,
+           exactly as before.
+
+        .. versionadded:: 2.2
+        """
+        for arg in (
+            'name',
+            'for_',
+            'exception_only',
+            'require_csrf',
+            'permission',
+        ):
+            if arg in view_options:
+                raise ConfigurationError(
+                    '%s may not be used as an argument to '
+                    'add_exception_group_view' % (arg,)
+                )
+        if context is None:
+            if ExceptionGroup is None:  # pragma: no cover
+                raise ConfigurationError(
+                    'add_exception_group_view requires Python 3.11 or newer'
+                )
+            context = ExceptionGroup
+        if (
+            ExceptionGroup is not None
+            and inspect.isclass(context)
+            and not issubclass(context, ExceptionGroup)
+        ):
+            raise ConfigurationError(
+                'context of add_exception_group_view must be a '
+                'ExceptionGroup subclass'
+            )
+        view_options.update(
+            dict(
+                view=view,
+                context=context,
+                name=EXCEPTION_GROUP_VIEW_NAME,
                 exception_only=True,
                 permission=NO_PERMISSION_REQUIRED,
                 require_csrf=False,
