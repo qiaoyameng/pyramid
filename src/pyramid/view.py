@@ -5,12 +5,19 @@ import venusian
 from zope.interface import providedBy
 
 from pyramid.exceptions import ConfigurationError, PredicateMismatch
+from pyramid.excgroup import (
+    BaseExceptionGroup as _BaseExceptionGroup,
+    ExceptionGroupResults,
+    LeafResult,
+    walk_leaves,
+)
 from pyramid.httpexceptions import (
     HTTPNotFound,
     HTTPTemporaryRedirect,
     default_exceptionresponse_view,
 )
 from pyramid.interfaces import (
+    IExceptionGroupView,
     IExceptionViewClassifier,
     IMultiView,
     IRequest,
@@ -732,6 +739,17 @@ class ViewMethodsMixin:
 
            Also added the ``reraise`` argument.
 
+        .. versionchanged:: 2.2
+           If the exception is an :class:`ExceptionGroup` (or
+           :class:`BaseExceptionGroup`) and an :term:`exception group view`
+           has been registered via
+           :meth:`pyramid.config.Configurator.add_exception_group_view`,
+           each leaf exception of the group is matched against the
+           registered exception views individually and the exception group
+           view decides the final response.  Without a registered exception
+           group view, exception groups keep being treated like any other
+           exception.
+
         """
         if request is None:
             request = self
@@ -747,6 +765,20 @@ class ViewMethodsMixin:
 
         exc = exc_info[1]
         attrs = request.__dict__
+
+        if _BaseExceptionGroup is not None and isinstance(
+            exc, _BaseExceptionGroup
+        ):
+            group_view = registry.queryUtility(IExceptionGroupView)
+            if group_view is not None:
+                return self._invoke_exception_group_view(
+                    exc_info,
+                    request=request,
+                    registry=registry,
+                    group_view=group_view,
+                    secure=secure,
+                )
+
         context_iface = providedBy(exc)
 
         # clear old generated request.response, if any; it may
@@ -787,5 +819,72 @@ class ViewMethodsMixin:
 
         # successful response, overwrite exception/exc_info
         attrs['exception'] = exc
+        attrs['exc_info'] = exc_info
+        return response
+
+    def _invoke_exception_group_view(
+        self, exc_info, request, registry, group_view, secure
+    ):
+        group = exc_info[1]
+        attrs = request.__dict__
+        request_iface = attrs.get('request_iface', IRequest)
+
+        leaves = []
+        matched = []
+
+        # clear old generated request.response, if any; it may
+        # have been mutated by the view, and its state is not
+        # sane (e.g. caching headers)
+        with hide_attrs(request, 'response', 'exc_info', 'exception'):
+            manager.push({'request': request, 'registry': registry})
+
+            try:
+                for leaf, path in walk_leaves(group):
+                    if not isinstance(leaf, Exception):
+                        # Never turn cancellations, keyboard interrupts
+                        # and other BaseException-only leaves into an
+                        # HTTP error response; leave them for upstream
+                        # handlers instead.
+                        leaves.append(LeafResult(leaf, path))
+                        continue
+
+                    attrs['exception'] = leaf
+                    attrs['exc_info'] = (type(leaf), leaf, leaf.__traceback__)
+
+                    try:
+                        response = _call_view(
+                            registry,
+                            request,
+                            leaf,
+                            providedBy(leaf),
+                            '',
+                            view_types=None,
+                            view_classifier=IExceptionViewClassifier,
+                            secure=secure,
+                            request_iface=request_iface.combined,
+                        )
+                    except PredicateMismatch:
+                        response = None
+
+                    result = LeafResult(leaf, path, response)
+                    leaves.append(result)
+                    if response is not None:
+                        matched.append(result)
+
+                if not matched:
+                    # no leaf exception could be handled; reraise the
+                    # original exception group untouched
+                    reraise_(*exc_info)
+
+                attrs['exception'] = group
+                attrs['exc_info'] = exc_info
+
+                results = ExceptionGroupResults(group, leaves)
+                response = group_view(results, request)
+            finally:
+                manager.pop()
+
+        # successful response, overwrite exception/exc_info
+        attrs['exception'] = group
         attrs['exc_info'] = exc_info
         return response

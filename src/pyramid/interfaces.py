@@ -746,6 +746,16 @@ class IExceptionViewClassifier(Interface):
     """*Internal only* marker interface for exception views."""
 
 
+class IExceptionGroupView(Interface):
+    """Marker interface for the :term:`exception group view` utility.
+
+    A callable registered as a utility for this interface (via
+    :meth:`pyramid.config.Configurator.add_exception_group_view`) is
+    invoked with the per-leaf results of rendering exception views for an
+    exception group, and decides the final response.
+    """
+
+
 class IView(Interface):
     def __call__(context, request):
         """Must return an object that implements IResponse."""

@@ -20,6 +20,7 @@ from pyramid.config.predicates import (
 )
 from pyramid.decorator import reify
 from pyramid.exceptions import ConfigurationError, PredicateMismatch
+from pyramid.excgroup import default_exception_group_view
 from pyramid.httpexceptions import (
     HTTPForbidden,
     HTTPNotFound,
@@ -29,6 +30,7 @@ from pyramid.interfaces import (
     PHASE1_CONFIG,
     IAcceptOrder,
     IException,
+    IExceptionGroupView,
     IExceptionViewClassifier,
     IMultiView,
     IPackageOverrides,
@@ -1889,6 +1891,64 @@ class ViewsConfiguratorMixin:
             )
         )
         return self.add_view(**view_options)
+
+    @viewdefaults
+    @action_method
+    def add_exception_group_view(self, view=None):
+        """Add an :term:`exception group view` to the current configuration
+        state.
+
+        An exception group view is a callable which decides the final
+        response when an :class:`ExceptionGroup` (or
+        :class:`BaseExceptionGroup`) is raised while processing a request.
+        When an exception group view is registered, Pyramid no longer
+        treats an exception group as a single opaque exception.  Instead,
+        each *leaf* exception of the group is matched against the
+        registered :term:`exception view`\\ s individually (honoring their
+        context and predicates), and the exception group view is called
+        with the collected results to produce the response.
+
+        The callable is invoked as ``view(results, request)`` where
+        ``results`` is a
+        :class:`pyramid.excgroup.ExceptionGroupResults` object describing
+        each leaf exception, the path of nested groups leading to it, and
+        the response generated for it (or ``None`` if no exception view
+        matched the leaf).  It must return a :term:`response` object, or
+        raise an exception (for example a group derived from
+        :meth:`pyramid.excgroup.ExceptionGroupResults.derive_unmatched`)
+        to leave (part of) the handling to upstream handlers.
+
+        If ``view`` is ``None``,
+        :func:`pyramid.excgroup.default_exception_group_view` is used,
+        which reraises any unmatched leaf exceptions (so that cancellations
+        and other :class:`BaseException` leaves are never swallowed into an
+        HTTP error response) and returns a response only when every leaf
+        was handled.
+
+        Registering an exception group view is optional; without one,
+        exception groups are treated like any other exception.
+
+        .. versionadded:: 2.2
+        """
+        if view is None:
+            view = default_exception_group_view
+        view = self.maybe_dotted(view)
+
+        def register():
+            self.registry.registerUtility(view, IExceptionGroupView)
+
+        intr = self.introspectable(
+            'exception group views',
+            IExceptionGroupView,
+            self.object_description(view),
+            'exception group view',
+        )
+        intr['view'] = view
+        self.action(
+            IExceptionGroupView,
+            register,
+            introspectables=(intr,),
+        )
 
     @action_method
     def set_view_mapper(self, mapper):

@@ -359,6 +359,55 @@ styles.
    present, Pyramid will not perform exception view handling.
 
 .. index::
+   single: exception group view
+   single: exception groups
+
+.. _exception_group_views:
+
+Exception Group Views
+---------------------
+
+Code which runs operations concurrently (for example with
+:class:`asyncio.TaskGroup`) may raise an :exc:`ExceptionGroup` containing
+several leaf exceptions.  By default, :app:`Pyramid` treats an exception
+group like any other exception: a single :term:`exception view` registered
+for the group's type (or for :exc:`Exception`) is invoked with the whole
+group.
+
+Optionally, an :term:`exception group view` may be registered via
+:meth:`pyramid.config.Configurator.add_exception_group_view`.  When one is
+registered, each *leaf* exception of the group is instead matched against
+the registered exception views individually, honoring their context and
+predicates, and each leaf is processed at most once.  The exception group
+view is then called as ``view(results, request)`` with a
+:class:`pyramid.excgroup.ExceptionGroupResults` object describing every
+leaf, the path of nested groups leading to it, and the response generated
+for it (or ``None`` when no exception view matched the leaf), and it
+decides the final response.
+
+.. code-block:: python
+    :linenos:
+
+    def my_group_view(results, request):
+        if results.unmatched:
+            # leave unhandled leaves to upstream handlers
+            raise results.derive_unmatched()
+        return results.matched[0].response
+
+    config.add_exception_group_view(my_group_view)
+
+If ``add_exception_group_view`` is called without an argument,
+:func:`pyramid.excgroup.default_exception_group_view` is used.  It reraises
+any unmatched leaf exceptions as a group derived from the original one
+(with the original group as its ``__cause__``, keeping the exception chain
+traceable), returns the response when every leaf agreed on a status code,
+and returns a ``500`` response rather than arbitrarily picking one leaf's
+status when they disagree.  Leaf exceptions which are not instances of
+:exc:`Exception` (such as :exc:`asyncio.CancelledError` or
+:exc:`KeyboardInterrupt`) are never converted into an HTTP error response;
+they are always reraised for upstream handlers.
+
+.. index::
    single: view http redirect
    single: http redirect (from a view)
 
