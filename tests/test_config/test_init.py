@@ -1248,6 +1248,243 @@ test_config.dummy_include2"""
         self.assertTrue(getattr(foo_meth, '__func__') is foo)
 
 
+class TentativeIncludeTests(unittest.TestCase):
+    def _makeOne(self, *arg, **kw):
+        from pyramid.config import Configurator
+
+        config = Configurator(*arg, **kw)
+        return config
+
+    def _getRoute(self, config, name):
+        from pyramid.interfaces import IRoutesMapper
+
+        mapper = config.registry.getUtility(IRoutesMapper)
+        return mapper.get_route(name)
+
+    def test_autocommit_raises(self):
+        from pyramid.exceptions import ConfigurationError
+
+        config = self._makeOne(autocommit=True)
+        self.assertRaises(
+            ConfigurationError, config.tentative_include, dummy_include
+        )
+
+    def test_keep_is_default_and_commits_normally(self):
+        def plugin(config):
+            config.add_route('home', '/kept')
+
+        config = self._makeOne()
+        block = config.tentative_include(plugin)
+        self.assertFalse(block.discarded)
+        config.commit()
+        self.assertEqual(self._getRoute(config, 'home').pattern, '/kept')
+
+    def test_explicit_keep(self):
+        def plugin(config):
+            config.add_route('home', '/kept')
+
+        config = self._makeOne()
+        block = config.tentative_include(plugin)
+        self.assertTrue(block.keep() is block)
+        config.commit()
+        self.assertEqual(self._getRoute(config, 'home').pattern, '/kept')
+
+    def test_keep_after_discard_raises(self):
+        from pyramid.exceptions import ConfigurationError
+
+        config = self._makeOne()
+        block = config.tentative_include(dummy_include)
+        block.discard()
+        self.assertRaises(ConfigurationError, block.keep)
+
+    def test_discard_removes_pending_actions(self):
+        def plugin(config):
+            config.add_route('home', '/candidate')
+
+        config = self._makeOne()
+        block = config.tentative_include(plugin)
+        self.assertTrue(len(config.action_state.actions) > 0)
+        block.discard()
+        self.assertTrue(block.discarded)
+        self.assertEqual(len(config.action_state.actions), 0)
+        config.commit()
+        self.assertEqual(self._getRoute(config, 'home'), None)
+
+    def test_discard_allows_rival_plugin_with_same_route_name(self):
+        def candidate(config):
+            config.add_route('home', '/candidate')
+
+        def rival(config):
+            config.add_route('home', '/rival')
+
+        config = self._makeOne()
+        block = config.tentative_include(candidate)
+        block.discard()
+        config.include(rival)
+        # no ConfigurationConflictError: the candidate's actions are gone
+        config.commit()
+        self.assertEqual(self._getRoute(config, 'home').pattern, '/rival')
+
+    def test_kept_block_conflicts_with_same_level_route(self):
+        from pyramid.exceptions import ConfigurationConflictError
+
+        def candidate(config):
+            config.add_route('home', '/candidate')
+
+        def rival(config):
+            config.add_route('home', '/rival')
+
+        config = self._makeOne()
+        config.tentative_include(candidate)
+        config.include(rival)
+        self.assertRaises(ConfigurationConflictError, config.commit)
+
+    def test_kept_block_is_overridden_by_local_config(self):
+        def candidate(config):
+            config.add_route('home', '/candidate')
+
+        config = self._makeOne()
+        config.tentative_include(candidate)
+        config.add_route('home', '/local')
+        config.commit()
+        self.assertEqual(self._getRoute(config, 'home').pattern, '/local')
+
+    def test_discard_preserves_actions_registered_after_block(self):
+        def candidate(config):
+            config.add_route('home', '/candidate')
+
+        config = self._makeOne()
+        block = config.tentative_include(candidate)
+        config.add_route('other', '/other')
+        block.discard()
+        config.commit()
+        self.assertEqual(self._getRoute(config, 'home'), None)
+        self.assertEqual(self._getRoute(config, 'other').pattern, '/other')
+
+    def test_nested_include_is_discarded_and_may_be_reincluded(self):
+        def nested(config):
+            config.add_route('home', '/nested')
+
+        def candidate(config):
+            config.include(nested)
+
+        config = self._makeOne()
+        block = config.tentative_include(candidate)
+        block.discard()
+        self.assertEqual(len(config.action_state.actions), 0)
+        # the include spec recorded by the discarded block was forgotten,
+        # so the nested module can be included again
+        config.include(nested)
+        config.commit()
+        self.assertEqual(self._getRoute(config, 'home').pattern, '/nested')
+
+    def test_nested_tentative_blocks(self):
+        def inner_plugin(config):
+            config.add_route('inner', '/inner')
+
+        def outer_plugin(config):
+            config.add_route('outer', '/outer')
+            config.tentative_include(inner_plugin)
+
+        config = self._makeOne()
+        outer = config.tentative_include(outer_plugin)
+        outer.discard()
+        config.commit()
+        self.assertEqual(self._getRoute(config, 'outer'), None)
+        self.assertEqual(self._getRoute(config, 'inner'), None)
+
+    def test_exception_in_with_block_discards(self):
+        def plugin(config):
+            config.add_route('home', '/candidate')
+
+        config = self._makeOne()
+        try:
+            with config.tentative_include(plugin) as block:
+                raise RuntimeError('boom')
+        except RuntimeError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError
+        self.assertTrue(block.discarded)
+        self.assertEqual(len(config.action_state.actions), 0)
+
+    def test_with_block_clean_exit_keeps(self):
+        def plugin(config):
+            config.add_route('home', '/kept')
+
+        config = self._makeOne()
+        with config.tentative_include(plugin) as block:
+            pass
+        self.assertFalse(block.discarded)
+        config.commit()
+        self.assertEqual(self._getRoute(config, 'home').pattern, '/kept')
+
+    def test_discard_after_commit_raises(self):
+        from pyramid.exceptions import ConfigurationError
+
+        def plugin(config):
+            config.add_route('home', '/committed')
+
+        config = self._makeOne()
+        block = config.tentative_include(plugin)
+        config.commit()
+        self.assertRaises(ConfigurationError, block.discard)
+        # the committed configuration is untouched
+        self.assertEqual(self._getRoute(config, 'home').pattern, '/committed')
+
+    def test_discard_after_make_wsgi_app_raises(self):
+        from pyramid.exceptions import ConfigurationError
+
+        config = self._makeOne()
+        block = config.tentative_include(dummy_include)
+        config.make_wsgi_app()
+        self.assertRaises(ConfigurationError, block.discard)
+
+    def test_discard_twice_raises(self):
+        from pyramid.exceptions import ConfigurationError
+
+        config = self._makeOne()
+        block = config.tentative_include(dummy_include)
+        block.discard()
+        self.assertRaises(ConfigurationError, block.discard)
+
+    def test_discard_removes_introspectables(self):
+        def plugin(config):
+            config.add_route('home', '/candidate')
+
+        config = self._makeOne()
+        block = config.tentative_include(plugin)
+        block.discard()
+        config.commit()
+        self.assertTrue(
+            config.introspector.get_category('routes') in (None, [])
+        )
+
+    def test_keep_preserves_introspectables(self):
+        def plugin(config):
+            config.add_route('home', '/kept')
+
+        config = self._makeOne()
+        config.tentative_include(plugin)
+        config.commit()
+        category = config.introspector.get_category('routes')
+        self.assertEqual(len(category), 1)
+        self.assertEqual(category[0]['introspectable']['name'], 'home')
+
+    def test_normal_include_unaffected(self):
+        from tests import test_config
+
+        config = self._makeOne()
+        config.include(dummy_include)
+        after = config.action_state
+        actions = after.actions
+        self.assertEqual(len(actions), 1)
+        action = actions[0]
+        self.assertEqual(action['discriminator'], 'discrim')
+        self.assertEqual(action['callable'], None)
+        self.assertEqual(action['args'], test_config)
+
+
 class TestConfigurator_add_directive(unittest.TestCase):
     def setUp(self):
         from pyramid.config import Configurator

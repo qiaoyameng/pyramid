@@ -160,6 +160,10 @@ class ActionState:
         # NB "actions" is an API, dep'd upon by pyramid_zcml's load_zcml func
         self.actions = []
         self._seen_files = set()
+        # bumped each time actions on this state are executed; used by
+        # pyramid.config.TentativeInclude to detect that the actions it
+        # tracks have been committed and can no longer be discarded
+        self._exec_generation = 0
 
     def processSpec(self, spec):
         """Check whether a callable needs to be processed.  The ``spec``
@@ -270,6 +274,7 @@ class ActionState:
         [('f', (1,), {}), ('g', (8,), {})]
 
         """
+        self._exec_generation += 1
         try:
             all_actions = []
             executed_actions = []

@@ -673,6 +673,66 @@ class Configurator(
                 finally:
                     self.end()
 
+    def tentative_include(self, callable, route_prefix=None):
+        """Include a configuration callable tentatively, keeping the
+        resulting configuration revocable until the next
+        :meth:`pyramid.config.Configurator.commit`.
+
+        This method behaves exactly like
+        :meth:`pyramid.config.Configurator.include` except that it returns
+        a :class:`pyramid.config.TentativeInclude` object which represents
+        the configuration "block" produced by the included callable.  Until
+        the configurator is committed, the block may be *discarded* via the
+        block's :meth:`~pyramid.config.TentativeInclude.discard` method,
+        which removes the pending configuration actions and any
+        :term:`introspectable` objects produced by the block, or *kept* (the
+        default) via :meth:`~pyramid.config.TentativeInclude.keep`, in which
+        case its actions participate in conflict detection and are executed
+        by the next commit, exactly as if
+        :meth:`pyramid.config.Configurator.include` had been used.
+
+        This is useful when probing a set of candidate plugins: each
+        candidate can be included, and candidates which turn out to be
+        unsuitable can be withdrawn before the configuration is committed.
+        Because configuration actions in :app:`Pyramid` are deferred until
+        :meth:`~pyramid.config.Configurator.commit` is called, discarding a
+        block is a genuine rollback: none of the block's actions have been
+        executed yet, so there is nothing to "unexecute".  Discarding only
+        removes the actions, include specifications, and introspectables
+        recorded by the block itself; configuration registered before or
+        after the block (including configuration which depends on or
+        overrides the block) is left untouched.
+
+        The returned block is also a context manager.  If the ``with``
+        body exits via an exception, the block is discarded automatically;
+        otherwise it is kept::
+
+            with config.tentative_include('my.candidate.plugin') as block:
+                if not plugin_is_compatible():
+                    block.discard()
+
+        Nested includes performed by the included callable are part of the
+        block and are kept or discarded along with it.  Tentative blocks
+        may themselves be nested.
+
+        A block may only be discarded while its actions are still pending.
+        Once :meth:`pyramid.config.Configurator.commit` (or
+        :meth:`pyramid.config.Configurator.make_wsgi_app`) has executed the
+        block's actions, discarding is no longer possible and raises
+        :exc:`pyramid.exceptions.ConfigurationError`.  Likewise, this
+        method cannot be used at all on a configurator created with
+        ``autocommit=True``, because such a configurator executes every
+        action immediately, leaving nothing that could be rolled back.
+
+        Note that only *configuration* state is tracked: arbitrary side
+        effects performed directly by the included callable (for example,
+        mutating the registry or module-level state without going through
+        a configurator directive) cannot be undone.
+
+        .. versionadded:: 2.2
+        """
+        return TentativeInclude(self, callable, route_prefix=route_prefix)
+
     def add_directive(self, name, directive, action_wrap=True):
         """
         Add a directive method to the configurator.
@@ -923,3 +983,130 @@ class Configurator(
 
 
 global_registries = WeakOrderedSet()
+
+
+class TentativeInclude:
+    """The revocable configuration block produced by
+    :meth:`pyramid.config.Configurator.tentative_include`.
+
+    The block records the configuration actions, include specifications,
+    and :term:`introspectable` objects registered by the included callable
+    (and by anything it included in turn).  While the configurator remains
+    uncommitted, the block can either be kept (the default) or discarded
+    via :meth:`discard`.  Instances of this class are not created directly;
+    use :meth:`pyramid.config.Configurator.tentative_include`.
+
+    .. versionadded:: 2.2
+    """
+
+    def __init__(self, configurator, callable, route_prefix=None):
+        if configurator.autocommit:
+            raise ConfigurationError(
+                'Cannot use tentative_include with a configurator created '
+                'with autocommit=True: configuration actions are executed '
+                'immediately, so there is nothing that can be discarded.'
+            )
+        self.configurator = configurator
+        self.callable = callable
+        state = configurator.action_state
+        self._action_state = state
+        self._exec_generation = state._exec_generation
+        introspector = configurator.introspector
+        self._introspector = introspector
+        self._intr_order_floor = introspector._counter
+        self._intr_categories = set(introspector._categories)
+        self._seen_files_before = set(state._seen_files)
+        self._actions_floor = len(state.actions)
+        self._discarded = False
+        configurator.include(callable, route_prefix=route_prefix)
+        self._actions = state.actions[self._actions_floor :]
+        self._seen_files_added = state._seen_files - self._seen_files_before
+        self._intr_order_ceiling = introspector._counter
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        # an exception unwinding through the block discards it, unless its
+        # actions have already been committed (in which case there is
+        # nothing left that could be discarded)
+        if (
+            exc_type is not None
+            and not self._discarded
+            and not self._committed
+        ):
+            self.discard()
+        return False
+
+    @property
+    def discarded(self):
+        """``True`` if the block has been discarded."""
+        return self._discarded
+
+    @property
+    def _committed(self):
+        state = self._action_state
+        return (
+            self.configurator.action_state is not state
+            or state._exec_generation != self._exec_generation
+        )
+
+    def keep(self):
+        """Keep the configuration produced by the block.  This is the
+        default; calling this method is only necessary for explicitness.
+        The block's actions will be checked for conflicts against, and
+        executed together with, all other pending actions the next time
+        :meth:`pyramid.config.Configurator.commit` is called."""
+        if self._discarded:
+            raise ConfigurationError(
+                'Cannot keep a tentative include that has been discarded.'
+            )
+        return self
+
+    def discard(self):
+        """Discard the configuration produced by the block.
+
+        Removes the pending configuration actions registered by the block
+        (and only those; actions registered before or after the block are
+        preserved), forgets the include specifications recorded by the
+        block so that the included modules may be included again, and
+        removes any :term:`introspectable` objects registered by the
+        block.
+
+        Raises :exc:`pyramid.exceptions.ConfigurationError` if the block
+        has already been discarded, or if its actions have already been
+        committed (via :meth:`pyramid.config.Configurator.commit` or
+        :meth:`pyramid.config.Configurator.make_wsgi_app`); committed
+        configuration cannot be rolled back.
+        """
+        if self._discarded:
+            raise ConfigurationError(
+                'This tentative include has already been discarded.'
+            )
+        if self._committed:
+            raise ConfigurationError(
+                'Cannot discard a tentative include: its configuration '
+                'actions have already been committed.'
+            )
+        self._discarded = True
+        state = self._action_state
+        # remove exactly the actions this block registered, preserving any
+        # actions registered afterwards
+        discarded = set(map(id, self._actions))
+        state.actions[:] = [
+            action for action in state.actions if id(action) not in discarded
+        ]
+        # forget the include specs recorded by the block so the modules it
+        # included may be included again
+        state._seen_files.difference_update(self._seen_files_added)
+        # remove any introspectables registered by the block
+        introspector = self._introspector
+        floor = self._intr_order_floor
+        ceiling = self._intr_order_ceiling
+        for category_name in introspector.categories():
+            category = introspector._categories[category_name]
+            for intr in set(category.values()):
+                if floor <= intr.order < ceiling:
+                    introspector.remove(category_name, intr.discriminator)
+            if not category and category_name not in self._intr_categories:
+                del introspector._categories[category_name]
